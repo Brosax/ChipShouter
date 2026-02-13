@@ -1,11 +1,12 @@
 import sys
 import time
+import csv
 import serial
 import serial.tools.list_ports
 from PySide6.QtWidgets import (QApplication, QMainWindow, QPushButton, QVBoxLayout, 
                              QHBoxLayout, QWidget, QSlider, QLabel, QTextEdit, QComboBox,
-                             QTabWidget, QSpinBox, QGroupBox, QGridLayout, QLineEdit,
-                             QSplitter, QFrame, QDockWidget)
+                             QSpinBox, QGroupBox, QGridLayout, QLineEdit,
+                             QSplitter, QFrame, QDockWidget, QFileDialog)
 from PySide6.QtCore import QThread, Signal, QObject, Qt, QTimer
 from PySide6.QtGui import QFont, QTextCursor
 from chipshouter import ChipSHOUTER
@@ -421,6 +422,10 @@ class MainWindow(QMainWindow):
         self.serial_timer = QTimer()
         self.serial_timer.timeout.connect(self.terminal_worker.read_data)
 
+        # Timer for repeated serial send
+        self.repeat_send_timer = QTimer()
+        self.repeat_send_timer.timeout.connect(self.send_repeat_payload)
+
         # Timer for auto-polling faults
         self.fault_timer = QTimer()
         self.fault_timer.timeout.connect(self.poll_faults)
@@ -537,8 +542,15 @@ class MainWindow(QMainWindow):
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
         main_layout = QVBoxLayout(central_widget)
+        main_layout.setContentsMargins(0, 0, 0, 0)
+        main_layout.addStretch(1)
+        self.setDockNestingEnabled(False)
 
-        # 串口选择 (Conexión) - Common for both modes
+        # ========== BASIC MODE TAB ==========
+        basic_tab = QWidget()
+        basic_layout = QVBoxLayout(basic_tab)
+
+        # ChipSHOUTER connection (inside left/top block)
         conn_group = QGroupBox("ChipSHOUTER Connection")
         conn_layout = QHBoxLayout(conn_group)
         self.port_box = QComboBox()
@@ -554,15 +566,7 @@ class MainWindow(QMainWindow):
         conn_layout.addWidget(self.port_box)
         conn_layout.addWidget(self.btn_connect)
         conn_layout.addWidget(self.btn_disconnect)
-        main_layout.addWidget(conn_group)
-
-        # Tab Widget for Basic mode + Serial Terminal
-        self.tab_widget = QTabWidget()
-        main_layout.addWidget(self.tab_widget)
-
-        # ========== BASIC MODE TAB ==========
-        basic_tab = QWidget()
-        basic_layout = QVBoxLayout(basic_tab)
+        basic_layout.addWidget(conn_group)
 
         # Configuration Group
         config_group = QGroupBox("Device Configuration")
@@ -639,10 +643,10 @@ class MainWindow(QMainWindow):
         action_group = QGroupBox("Actions")
         action_layout = QHBoxLayout(action_group)
         self.btn_arm = QPushButton("ARM DEVICE")
-        self.btn_arm.setStyleSheet("background-color: #b71c1c; color: white;")
+        self.btn_arm.setStyleSheet("background-color: #c62828; color: white; font-weight: 900; border: 2px solid #ff8a80;")
         self.btn_arm.setFixedHeight(50)
         self.btn_disarm = QPushButton("DISARM")
-        self.btn_disarm.setStyleSheet("background-color: #1b5e20; font-weight: bold; color: white;")
+        self.btn_disarm.setStyleSheet("background-color: #1b5e20; font-weight: 900; color: white; border: 1px solid #66bb6a;")
         self.btn_disarm.setFixedHeight(50)
         self.btn_disarm.setEnabled(False)  # Start in disarmed state
         self.btn_pulse = QPushButton("PULSE")
@@ -663,7 +667,13 @@ class MainWindow(QMainWindow):
         action_layout.addWidget(self.btn_mute)
         basic_layout.addWidget(action_group)
 
-        self.tab_widget.addTab(basic_tab, "Basic Mode")
+        self.dock_basic_mode = QDockWidget("Basic Mode", self)
+        self.dock_basic_mode.setObjectName("dock_basic_mode")
+        self.dock_basic_mode.setAllowedAreas(Qt.LeftDockWidgetArea)
+        self.dock_basic_mode.setFeatures(QDockWidget.NoDockWidgetFeatures)
+        self.dock_basic_mode.setTitleBarWidget(QWidget())
+        self.dock_basic_mode.setWidget(basic_tab)
+        self.addDockWidget(Qt.LeftDockWidgetArea, self.dock_basic_mode)
 
         # ========== SERIAL TERMINAL TAB ==========
         terminal_tab = QWidget()
@@ -694,7 +704,33 @@ class MainWindow(QMainWindow):
         term_conn_layout.addWidget(self.btn_term_disconnect)
         terminal_layout.addWidget(term_conn_group)
 
+        # Quick test-board controls
+        quick_group = QGroupBox("Test Board Quick Control")
+        quick_layout = QHBoxLayout(quick_group)
+        quick_layout.addWidget(QLabel("Mode:"))
+        self.test_mode_box = QComboBox()
+        self.test_mode_box.addItems(["1", "2", "3", "4"])
+        self.test_mode_box.setCurrentText("1")
+        quick_layout.addWidget(self.test_mode_box)
+        self.btn_send_mode = QPushButton("Send MODE")
+        self.btn_send_mode.setStyleSheet("background-color: #1565c0; color: white;")
+        quick_layout.addWidget(self.btn_send_mode)
+        self.btn_send_signal = QPushButton("Send START Signal")
+        self.btn_send_signal.setStyleSheet("background-color: #2e7d32; color: white; font-weight: bold;")
+        quick_layout.addWidget(self.btn_send_signal)
+        quick_layout.addStretch()
+        terminal_layout.addWidget(quick_group)
+
         # Terminal output
+        term_log_header = QHBoxLayout()
+        term_log_header.addWidget(QLabel("Terminal Log:"))
+        self.btn_export_terminal_csv = QPushButton("Export CSV")
+        self.btn_export_terminal_csv.setStyleSheet("background-color: #1565c0; color: white;")
+        self.btn_export_terminal_csv.setFixedHeight(24)
+        term_log_header.addWidget(self.btn_export_terminal_csv)
+        term_log_header.addStretch()
+        terminal_layout.addLayout(term_log_header)
+
         self.terminal_output = QTextEdit()
         self.terminal_output.setReadOnly(True)
         self.terminal_output.setFont(QFont("Consolas", 10))
@@ -714,33 +750,58 @@ class MainWindow(QMainWindow):
         cmd_layout.addWidget(self.btn_clear_term)
         terminal_layout.addLayout(cmd_layout)
 
-        self.tab_widget.addTab(terminal_tab, "Serial Terminal")
+        # Repeat send controls
+        repeat_group = QGroupBox("Repeat Send")
+        repeat_layout = QGridLayout(repeat_group)
+        repeat_layout.addWidget(QLabel("Content:"), 0, 0)
+        self.repeat_payload_input = QLineEdit()
+        self.repeat_payload_input.setPlaceholderText("e.g. START or MODE:1")
+        self.repeat_payload_input.setText("START")
+        repeat_layout.addWidget(self.repeat_payload_input, 0, 1, 1, 3)
+
+        repeat_layout.addWidget(QLabel("Interval:"), 1, 0)
+        self.repeat_interval_spin = QSpinBox()
+        self.repeat_interval_spin.setRange(10, 600000)
+        self.repeat_interval_spin.setValue(1000)
+        self.repeat_interval_spin.setSuffix(" ms")
+        repeat_layout.addWidget(self.repeat_interval_spin, 1, 1)
+
+        self.btn_repeat_start = QPushButton("Start Repeat")
+        self.btn_repeat_start.setStyleSheet("background-color: #6a1b9a; color: white;")
+        self.btn_repeat_stop = QPushButton("Stop")
+        self.btn_repeat_stop.setStyleSheet("background-color: #424242; color: white;")
+        self.btn_repeat_stop.setEnabled(False)
+        repeat_layout.addWidget(self.btn_repeat_start, 1, 2)
+        repeat_layout.addWidget(self.btn_repeat_stop, 1, 3)
+        terminal_layout.addWidget(repeat_group)
+
+        self.dock_terminal_mode = QDockWidget("Serial Terminal", self)
+        self.dock_terminal_mode.setObjectName("dock_terminal_mode")
+        self.dock_terminal_mode.setAllowedAreas(Qt.RightDockWidgetArea)
+        self.dock_terminal_mode.setFeatures(QDockWidget.NoDockWidgetFeatures)
+        self.dock_terminal_mode.setWidget(terminal_tab)
+        self.addDockWidget(Qt.RightDockWidgetArea, self.dock_terminal_mode)
 
         self.setup_docks()
 
+        # Force 3-block layout: top-left basic, top-right terminal, bottom log area
+        self.splitDockWidget(self.dock_basic_mode, self.dock_terminal_mode, Qt.Horizontal)
+        self.splitDockWidget(self.dock_basic_mode, self.dock_log, Qt.Vertical)
+        self.dock_log.raise_()
+
     def setup_docks(self):
-        # Event Log Dock
-        self.dock_log = QDockWidget("Event Log", self)
+        # Unified Log Dock (Event + Fault)
+        self.dock_log = QDockWidget("Log Panel", self)
         self.dock_log.setObjectName("dock_log")
-        self.dock_log.setAllowedAreas(Qt.AllDockWidgetAreas)
+        self.dock_log.setAllowedAreas(Qt.BottomDockWidgetArea)
+        self.dock_log.setFeatures(QDockWidget.NoDockWidgetFeatures)
 
-        self.log_view_basic = QTextEdit()
-        self.log_view_basic.setReadOnly(True)
-        self.dock_log.setWidget(self.log_view_basic)
-        self.addDockWidget(Qt.BottomDockWidgetArea, self.dock_log)
+        log_widget = QWidget()
+        log_layout = QVBoxLayout(log_widget)
+        log_layout.setContentsMargins(0, 0, 0, 0)
 
-        # Fault Log Dock
-        self.dock_fault = QDockWidget("Fault Log", self)
-        self.dock_fault.setObjectName("dock_fault")
-        self.dock_fault.setAllowedAreas(Qt.AllDockWidgetAreas)
-
-        fault_widget = QWidget()
-        fault_layout = QVBoxLayout(fault_widget)
-        fault_layout.setContentsMargins(0, 0, 0, 0) # Tight layout
-
-        # Buttons header
-        fault_header = QHBoxLayout()
-        fault_header.addWidget(QLabel("Fault Log:"))
+        log_header = QHBoxLayout()
+        log_header.addWidget(QLabel("Logs:"))
         self.btn_read_faults = QPushButton("Read Current")
         self.btn_read_faults.setFixedHeight(24)
         self.btn_read_latched = QPushButton("Read Latched")
@@ -748,22 +809,25 @@ class MainWindow(QMainWindow):
         self.btn_clear_faults = QPushButton("Clear Faults")
         self.btn_clear_faults.setFixedHeight(24)
         self.btn_clear_faults.setStyleSheet("background-color: #bf360c; color: white;")
-        self.btn_clear_fault_log = QPushButton("Clear Log")
-        self.btn_clear_fault_log.setFixedHeight(24)
-        fault_header.addWidget(self.btn_read_faults)
-        fault_header.addWidget(self.btn_read_latched)
-        fault_header.addWidget(self.btn_clear_faults)
-        fault_header.addWidget(self.btn_clear_fault_log)
-        
-        fault_layout.addLayout(fault_header)
+        log_header.addWidget(self.btn_read_faults)
+        log_header.addWidget(self.btn_read_latched)
+        log_header.addWidget(self.btn_clear_faults)
+        self.btn_clear_event_log = QPushButton("Clear")
+        self.btn_clear_event_log.setFixedHeight(24)
+        log_header.addWidget(self.btn_clear_event_log)
+        log_header.addStretch()
+        log_layout.addLayout(log_header)
 
-        self.fault_log_view = QTextEdit()
-        self.fault_log_view.setReadOnly(True)
-        self.fault_log_view.setStyleSheet("background-color: #252526; color: #eee;")
-        fault_layout.addWidget(self.fault_log_view)
+        self.log_view_basic = QTextEdit()
+        self.log_view_basic.setReadOnly(True)
+        self.log_view_basic.setStyleSheet("background-color: #252526; color: #eee;")
+        log_layout.addWidget(self.log_view_basic)
 
-        self.dock_fault.setWidget(fault_widget)
-        self.addDockWidget(Qt.BottomDockWidgetArea, self.dock_fault)
+        # Alias for compatibility with existing methods
+        self.fault_log_view = self.log_view_basic
+
+        self.dock_log.setWidget(log_widget)
+        self.addDockWidget(Qt.BottomDockWidgetArea, self.dock_log)
 
     def setup_connections(self):
         # Connection buttons - ChipSHOUTER (with UI mutex)
@@ -795,6 +859,11 @@ class MainWindow(QMainWindow):
         self.btn_send_cmd.clicked.connect(self.send_terminal_command)
         self.terminal_input.returnPressed.connect(self.send_terminal_command)
         self.btn_clear_term.clicked.connect(self.terminal_output.clear)
+        self.btn_send_mode.clicked.connect(self.send_test_mode)
+        self.btn_send_signal.clicked.connect(self.send_test_signal)
+        self.btn_repeat_start.clicked.connect(self.start_repeat_send)
+        self.btn_repeat_stop.clicked.connect(self.stop_repeat_send)
+        self.btn_export_terminal_csv.clicked.connect(self.export_terminal_log_csv)
 
         # Terminal worker signals (use UniqueConnection to prevent duplicates)
         self.terminal_worker.data_received.connect(self.append_terminal_data, Qt.UniqueConnection)
@@ -804,7 +873,7 @@ class MainWindow(QMainWindow):
         self.btn_read_faults.clicked.connect(lambda: self.worker.request_read_faults_current.emit(True))
         self.btn_read_latched.clicked.connect(self.worker.request_read_faults_latched.emit)
         self.btn_clear_faults.clicked.connect(self.worker.request_clear_faults.emit)
-        self.btn_clear_fault_log.clicked.connect(self.fault_log_view.clear)
+        self.btn_clear_event_log.clicked.connect(self.log_view_basic.clear)
 
         # ChipSHOUTER Worker signals
         self.worker.log_signal.connect(self.append_log)
@@ -863,11 +932,27 @@ class MainWindow(QMainWindow):
     def on_api_armed_changed(self, armed):
         self.api_armed = armed
         if armed:
-            self.btn_arm.setStyleSheet("background-color: #d32f2f; font-weight: bold; color: white;")
-            self.btn_disarm.setStyleSheet("background-color: #1b5e20; color: white;")
+            self.btn_arm.setText("⚠ ARMED")
+            self.btn_arm.setStyleSheet(
+                "background-color: #ff1744; color: #fff59d; font-weight: 900; "
+                "font-size: 16px; border: 3px solid #ffff00;"
+            )
+            self.btn_disarm.setText("SAFE DISARM")
+            self.btn_disarm.setStyleSheet(
+                "background-color: #00c853; color: black; font-weight: 900; "
+                "font-size: 14px; border: 2px solid #69f0ae;"
+            )
         else:
-            self.btn_arm.setStyleSheet("background-color: #b71c1c; color: white;")
-            self.btn_disarm.setStyleSheet("background-color: #1b5e20; font-weight: bold; color: white;")
+            self.btn_arm.setText("ARM DEVICE")
+            self.btn_arm.setStyleSheet(
+                "background-color: #c62828; color: white; font-weight: 900; "
+                "font-size: 14px; border: 2px solid #ff8a80;"
+            )
+            self.btn_disarm.setText("DISARM")
+            self.btn_disarm.setStyleSheet(
+                "background-color: #1b5e20; color: white; font-weight: 900; "
+                "font-size: 13px; border: 1px solid #66bb6a;"
+            )
         self.refresh_action_buttons()
 
     def on_api_operation_timeout(self):
@@ -929,6 +1014,7 @@ class MainWindow(QMainWindow):
 
     def disconnect_terminal(self):
         self.serial_timer.stop()
+        self.stop_repeat_send()
         self.terminal_worker.disconnect_serial()
         self.terminal_connected = False
         self.terminal_port = None
@@ -1007,6 +1093,57 @@ class MainWindow(QMainWindow):
             self.terminal_input.clear()
             self.terminal_worker.send_data(cmd)
 
+    def send_test_mode(self):
+        if not self.terminal_worker.is_connected:
+            self.append_terminal_status("Error: Terminal no conectado")
+            return
+        mode = self.test_mode_box.currentText()
+        self.terminal_worker.send_data(f"MODE:{mode}")
+
+    def send_test_signal(self):
+        if not self.terminal_worker.is_connected:
+            self.append_terminal_status("Error: Terminal no conectado")
+            return
+        self.terminal_worker.send_data("START")
+
+    def start_repeat_send(self):
+        if not self.terminal_worker.is_connected:
+            self.append_terminal_status("Error: Terminal no conectado")
+            return
+
+        payload = self.repeat_payload_input.text().strip()
+        if not payload:
+            self.append_terminal_status("Error: contenido vacío para envío repetido")
+            return
+
+        interval_ms = self.repeat_interval_spin.value()
+        self.repeat_send_timer.start(interval_ms)
+        self.btn_repeat_start.setEnabled(False)
+        self.btn_repeat_stop.setEnabled(True)
+        self.append_terminal_status(f"Repeat TX iniciado: '{payload}' cada {interval_ms} ms")
+
+    def stop_repeat_send(self):
+        was_running = self.repeat_send_timer.isActive()
+        self.repeat_send_timer.stop()
+        self.btn_repeat_start.setEnabled(True)
+        self.btn_repeat_stop.setEnabled(False)
+        if was_running:
+            self.append_terminal_status("Repeat TX detenido")
+
+    def send_repeat_payload(self):
+        if not self.terminal_worker.is_connected:
+            self.stop_repeat_send()
+            self.append_terminal_status("Repeat TX detenido: terminal desconectado")
+            return
+
+        payload = self.repeat_payload_input.text().strip()
+        if not payload:
+            self.stop_repeat_send()
+            self.append_terminal_status("Repeat TX detenido: contenido vacío")
+            return
+
+        self.terminal_worker.send_data(payload)
+
     def append_terminal_data(self, data):
         # Filter duplicate data received within 500ms
         current_time = time.time()
@@ -1063,6 +1200,78 @@ class MainWindow(QMainWindow):
         self.fault_log_view.append(f"<span style='color:{color};'>[{timestamp}] {text}</span>")
         self.fault_log_view.moveCursor(QTextCursor.End)
 
+    def export_event_log_csv(self):
+        self.export_log_to_csv(self.log_view_basic, "event_log")
+
+    def export_fault_log_csv(self):
+        self.export_log_to_csv(self.fault_log_view, "fault_log")
+
+    def export_terminal_log_csv(self):
+        log_text = self.terminal_output.toPlainText().strip()
+        if not log_text:
+            self.append_log("No hay datos para exportar (terminal_log)")
+            return
+
+        default_file = f"terminal_log_{time.strftime('%Y%m%d_%H%M%S')}.csv"
+        file_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Export Terminal Log to CSV",
+            default_file,
+            "CSV Files (*.csv);;All Files (*)"
+        )
+
+        if not file_path:
+            return
+
+        try:
+            with open(file_path, "w", newline="", encoding="utf-8-sig") as csv_file:
+                writer = csv.writer(csv_file)
+                for line in log_text.splitlines():
+                    clean_line = line.strip()
+                    if clean_line:
+                        writer.writerow([clean_line])
+
+            self.append_log(f"Terminal log exportado a CSV: {file_path}")
+        except Exception as e:
+            self.append_log(f"Error exportando terminal CSV: {str(e)}")
+
+    def export_log_to_csv(self, text_widget, default_name):
+        log_text = text_widget.toPlainText().strip()
+        if not log_text:
+            self.append_log(f"No hay datos para exportar ({default_name})")
+            return
+
+        default_file = f"{default_name}_{time.strftime('%Y%m%d_%H%M%S')}.csv"
+        file_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Export Log to CSV",
+            default_file,
+            "CSV Files (*.csv);;All Files (*)"
+        )
+
+        if not file_path:
+            return
+
+        try:
+            with open(file_path, "w", newline="", encoding="utf-8-sig") as csv_file:
+                writer = csv.writer(csv_file)
+                writer.writerow(["timestamp", "message", "raw"])
+                for line in log_text.splitlines():
+                    clean_line = line.strip()
+                    if not clean_line:
+                        continue
+                    ts = ""
+                    msg = clean_line
+                    if clean_line.startswith("[") and "]" in clean_line:
+                        right_idx = clean_line.find("]")
+                        ts = clean_line[1:right_idx]
+                        msg = clean_line[right_idx + 1:].strip()
+                    writer.writerow([ts, msg, clean_line])
+
+            self.append_log(f"Log exportado a CSV: {file_path}")
+        except Exception as e:
+            self.append_log(f"Error exportando CSV: {str(e)}")
+
     def handle_reset(self):
         self.api_armed = False
         self.refresh_action_buttons()
@@ -1072,6 +1281,7 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event):
         # Stop timers
         self.serial_timer.stop()
+        self.repeat_send_timer.stop()
         self.fault_timer.stop()
         self.arm_state_timer.stop()
         # Disconnect terminal
