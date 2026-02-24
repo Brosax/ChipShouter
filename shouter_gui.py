@@ -386,65 +386,77 @@ class SerialTerminalWorker(QObject):
         finally:
             self.is_reading = False
 
-# --- Sweep Worker: parameter sweep for fault injection ---
+# --- Sweep Worker: KW45 fault injection with external hardware trigger ---
 class SweepWorker(QObject):
     progress_signal = Signal(int, int, str)  # current, total, info
     result_signal = Signal(dict)
     sweep_finished = Signal(str)
     log_signal = Signal(str)
+    _start_requested = Signal(object, object, dict)  # cs, serial_port, config
+
+    RESET_MARKER = "KW45 Ready. Waiting for commands..."
 
     def __init__(self):
         super().__init__()
+        self._start_requested.connect(self.start_sweep)
         self.cs = None
         self._stop_requested = False
         self.is_running = False
         self.results = []
 
-    def start_sweep(self, cs, target_port, target_baud, config):
+    # ---- public API ----
+    def start_sweep(self, cs, target_serial, config):
+        """
+        Run parameter sweep using the KW45 external-trigger workflow.
+        *target_serial* is the already-open serial.Serial from the Serial Terminal.
+        """
         self.cs = cs
         self._stop_requested = False
         self.is_running = True
         self.results = []
-        target_serial = None
+        self.reset_count = 0
 
-        # Connect to target board if port provided
-        if target_port and target_port not in ('', 'None', 'No ports found'):
-            try:
-                target_serial = serial.Serial(port=target_port, baudrate=target_baud, timeout=2)
-                mode = config.get('mode', '1')
-                target_serial.write(f"MODE:{mode}\n".encode())
-                time.sleep(0.5)
-                target_serial.reset_input_buffer()
-                self.log_signal.emit(f"Target connected: {target_port} @ {target_baud}, Mode {mode}")
-            except Exception as e:
-                self.log_signal.emit(f"Target connection error: {e}. Continuing without target.")
-                target_serial = None
-        else:
-            self.log_signal.emit("No target port configured. Pulses will fire without response checking.")
+        if not target_serial or not target_serial.is_open:
+            self.log_signal.emit("ERROR: Serial Terminal must be connected to the target board.")
+            self.is_running = False
+            self.sweep_finished.emit("ABORTED: No target serial connection.")
+            return
 
-        # Build sweep grid
+        ser = target_serial
+
+        # ---- Build sweep grid ----
         voltages = list(range(config['v_start'], config['v_end'] + 1, max(1, config['v_step'])))
         pulse_widths = list(range(config['pw_start'], config['pw_end'] + 1, max(1, config['pw_step'])))
-        total = len(voltages) * len(pulse_widths)
+        delays = list(range(config.get('delay_start', 0),
+                            config.get('delay_end', 0) + 1,
+                            max(1, config.get('delay_step', 1))))
+        if not delays:
+            delays = [0]
+
+        total = len(voltages) * len(pulse_widths) * len(delays)
         n_pulses = config.get('pulses_per_point', 5)
+        mode = config.get('mode', '1')
 
-        self.log_signal.emit(f"Sweep: {len(voltages)} V x {len(pulse_widths)} PW = {total} points, {n_pulses} pulses/point")
+        self.log_signal.emit(
+            f"Sweep grid: {len(voltages)}V x {len(pulse_widths)}PW x {len(delays)}Delay "
+            f"= {total} points, {n_pulses} pulses/point")
 
-        # Fixed params
+        # ---- Fixed params ----
         try:
             self.cs.pulse.repeat = config.get('pulse_repeat', 1)
             self.cs.pulse.deadtime = config.get('deadtime', 10)
             self.cs.mute = 1
+            # Configure external hardware trigger (KW45 drives trigger line)
+            self.cs.hwtrig_mode = True   # Active-High
+            self.cs.hwtrig_term = False  # High impedance
+            self.log_signal.emit("HW trigger: external, active-high, hi-Z termination")
         except Exception as e:
-            self.log_signal.emit(f"Fixed param error: {e}")
+            self.log_signal.emit(f"Fixed param config error: {e}")
 
-        # Get baseline CT from target
-        baseline_ct = None
-        if target_serial:
-            resp = self._target_exchange(target_serial)
-            if resp and 'CT' in resp:
-                baseline_ct = resp['CT']
-                self.log_signal.emit(f"Baseline CT: {baseline_ct}")
+        # ---- Set KW45 mode & get baseline CT ----
+        baseline_ct = self._setup_target_mode(ser, mode)
+        if baseline_ct is None and not self._stop_requested:
+            self.log_signal.emit("WARNING: Could not obtain baseline CT. Glitch detection may be inaccurate.")
 
         step = 0
         for v in voltages:
@@ -453,92 +465,170 @@ class SweepWorker(QObject):
             for pw in pulse_widths:
                 if self._stop_requested:
                     break
-                step += 1
-
-                # Set voltage and pulse width
-                try:
-                    self.cs.voltage = v
-                    self.cs.pulse.width = pw
-                    time.sleep(0.05)
-                except Exception as e:
-                    self.log_signal.emit(f"Config error V={v} PW={pw}: {e}")
-                    continue
-
-                # Arm
-                try:
-                    self.cs.armed = 1
-                    time.sleep(0.2)
-                except Exception as e:
-                    self.log_signal.emit(f"Arm error V={v} PW={pw}: {e}")
-                    continue
-
-                glitch = 0
-                error = 0
-                normal = 0
-
-                for _ in range(n_pulses):
+                for delay_us in delays:
                     if self._stop_requested:
                         break
+                    step += 1
+
+                    # ---- Configure ChipSHOUTER ----
                     try:
-                        self.cs.pulse = 1
+                        self.cs.voltage = v
+                        self.cs.pulse.width = pw
+                        if delay_us > 0:
+                            self.cs.trigger.offset = delay_us
                         time.sleep(0.05)
-                        if target_serial:
-                            resp = self._target_exchange(target_serial)
-                            if resp is None:
-                                error += 1
-                            elif baseline_ct and resp.get('CT') != baseline_ct:
-                                glitch += 1
-                            else:
-                                normal += 1
+                    except Reset_Exception:
+                        self.log_signal.emit(f"ChipSHOUTER reset at V={v} PW={pw}")
+                        self._safe_disarm()
+                        continue
+                    except Exception as e:
+                        self.log_signal.emit(f"Config error V={v} PW={pw}: {e}")
+                        continue
+
+                    # ---- ARM ----
+                    try:
+                        self.cs.armed = 1
+                        time.sleep(0.2)
+                    except Reset_Exception:
+                        self.log_signal.emit(f"ChipSHOUTER reset on ARM V={v} PW={pw}")
+                        continue
+                    except Exception as e:
+                        self.log_signal.emit(f"Arm error V={v} PW={pw}: {e}")
+                        continue
+
+                    glitch = 0
+                    error = 0
+                    normal = 0
+                    reset = 0
+                    last_ct = ""
+
+                    for pulse_idx in range(n_pulses):
+                        if self._stop_requested:
+                            break
+
+                        # Send START -> KW45 encrypts + generates trigger -> ChipSHOUTER fires
+                        resp = self._target_exchange(ser)
+
+                        if resp is None:
+                            error += 1
+                            continue
+
+                        if resp.get('_reset'):
+                            # KW45 reset detected
+                            reset += 1
+                            self.reset_count += 1
+                            self.log_signal.emit(
+                                f"KW45 RESET #{self.reset_count} at V={v} PW={pw} D={delay_us}µs pulse#{pulse_idx+1}")
+                            # Re-configure mode and refresh baseline
+                            new_bl = self._setup_target_mode(ser, mode)
+                            if new_bl:
+                                baseline_ct = new_bl
+                                self.log_signal.emit(f"New baseline CT after reset: {baseline_ct}")
+                            # Re-arm for remaining pulses
+                            try:
+                                self.cs.armed = 1
+                                time.sleep(0.2)
+                            except Exception:
+                                break
+                            continue
+
+                        ct = resp.get('CT', '')
+                        last_ct = ct
+                        if baseline_ct and ct and ct != baseline_ct:
+                            glitch += 1
                         else:
                             normal += 1
-                    except Exception:
-                        error += 1
 
-                # Disarm after each point
-                try:
-                    self.cs.armed = 0
-                except Exception:
-                    pass
+                    # ---- DISARM after each test point ----
+                    self._safe_disarm()
 
-                result = {
-                    'voltage': v, 'pulse_width': pw,
-                    'glitches': glitch, 'errors': error, 'normal': normal,
-                    'total': n_pulses,
-                    'rate': f"{glitch / n_pulses * 100:.1f}%" if n_pulses > 0 else "0%"
-                }
-                self.results.append(result)
-                self.result_signal.emit(result)
+                    n_total = glitch + error + normal + reset
+                    result = {
+                        'voltage': v,
+                        'pulse_width': pw,
+                        'delay_us': delay_us,
+                        'glitches': glitch,
+                        'errors': error,
+                        'normal': normal,
+                        'resets': reset,
+                        'total': n_total,
+                        'baseline_ct': baseline_ct or '',
+                        'last_ct': last_ct,
+                        'rate': f"{glitch / n_total * 100:.1f}%" if n_total > 0 else "0%"
+                    }
+                    self.results.append(result)
+                    self.result_signal.emit(result)
 
-                tag = "GLITCH" if glitch > 0 else ("ERROR" if error > 0 else "Normal")
-                self.progress_signal.emit(step, total,
-                    f"[{step}/{total}] V={v}V PW={pw}ns -> {tag} (G:{glitch} E:{error} N:{normal})")
-                time.sleep(0.1)
+                    if glitch > 0:
+                        tag = "GLITCH"
+                    elif reset > 0:
+                        tag = "RESET"
+                    elif error > 0:
+                        tag = "ERROR"
+                    else:
+                        tag = "Normal"
+                    self.progress_signal.emit(step, total,
+                        f"[{step}/{total}] V={v}V PW={pw}ns D={delay_us}µs -> {tag} "
+                        f"(G:{glitch} R:{reset} E:{error} N:{normal})")
+                    time.sleep(0.05)
 
-        # Cleanup
-        try:
-            self.cs.armed = 0
-        except Exception:
-            pass
-        if target_serial and target_serial.is_open:
-            target_serial.close()
-
+        # ---- Cleanup ----
+        self._safe_disarm()
         self.is_running = False
+
         total_g = sum(r['glitches'] for r in self.results)
+        total_r = sum(r['resets'] for r in self.results)
         sensitive = len([r for r in self.results if r['glitches'] > 0])
         prefix = 'STOPPED' if self._stop_requested else 'COMPLETE'
-        self.sweep_finished.emit(f"{prefix}: {step}/{total} points, {total_g} glitches in {sensitive} sensitive points")
+        self.sweep_finished.emit(
+            f"{prefix}: {step}/{total} points | "
+            f"Glitches: {total_g} in {sensitive} points | Resets: {total_r}")
 
-    def _target_exchange(self, ser):
-        """Send START to target board and parse DATA_START/DATA_END response."""
+    # ---- internal helpers ----
+    def _setup_target_mode(self, ser, mode):
+        """Send MODE:<n>, do one clean START exchange, return baseline CT or None."""
         try:
             ser.reset_input_buffer()
-            ser.write(b"START\n")
+            ser.write(f"MODE:{mode}\r\n".encode())
+            time.sleep(0.5)
+            ser.reset_input_buffer()
+            self.log_signal.emit(f"Target MODE:{mode} set")
+
+            # First exchange to get baseline
+            resp = self._target_exchange(ser)
+            if resp and 'CT' in resp and not resp.get('_reset'):
+                self.log_signal.emit(f"Baseline CT: {resp['CT']}")
+                return resp['CT']
+            return None
+        except Exception as e:
+            self.log_signal.emit(f"Target mode setup error: {e}")
+            return None
+
+    def _target_exchange(self, ser):
+        """
+        Send START to KW45 and parse the DATA_START / DATA_END response.
+        During encryption the KW45 generates a 125µs trigger pulse that
+        fires the ChipSHOUTER via external HW trigger.
+        Returns dict with parsed fields, or {'_reset': True} on reset, or None on error.
+        """
+        try:
+            ser.reset_input_buffer()
+            ser.write(b"START\r\n")
             data = {}
             collecting = False
             t0 = time.time()
-            while (time.time() - t0) < 2.0:
-                line = ser.readline().decode('utf-8', errors='ignore').strip()
+            while (time.time() - t0) < 3.0:
+                raw = ser.readline()
+                if not raw:
+                    continue
+                line = raw.decode('utf-8', errors='ignore').strip()
+                if not line:
+                    continue
+
+                # Detect KW45 reset
+                if self.RESET_MARKER in line:
+                    return {'_reset': True}
+
                 if "--- DATA_START ---" in line:
                     collecting = True
                     continue
@@ -550,11 +640,17 @@ class SweepWorker(QObject):
                     parts = line.split(":", 1)
                     if len(parts) == 2:
                         data[parts[0].strip()] = parts[1].strip()
-                if not line and collecting:
-                    break
             return data if data else None
         except Exception:
             return None
+
+    def _safe_disarm(self):
+        """Disarm ChipSHOUTER, ignoring errors."""
+        try:
+            if self.cs:
+                self.cs.armed = 0
+        except Exception:
+            pass
 
     def stop_sweep(self):
         self._stop_requested = True
@@ -993,6 +1089,11 @@ class MainWindow(QMainWindow):
         sweep_tab = QWidget()
         sweep_layout = QVBoxLayout(sweep_tab)
 
+        # Info label: target uses Serial Terminal connection
+        sweep_info = QLabel("⚡ Uses Serial Terminal connection to target board (ext HW trigger)")
+        sweep_info.setStyleSheet("color: #ffab40; font-weight: bold; padding: 4px;")
+        sweep_layout.addWidget(sweep_info)
+
         # Sweep voltage range
         sv_group = QGroupBox("Voltage Sweep (V)")
         sv_grid = QGridLayout(sv_group)
@@ -1039,6 +1140,29 @@ class MainWindow(QMainWindow):
         sp_grid.addWidget(self.sweep_pw_step, 0, 5)
         sweep_layout.addWidget(sp_group)
 
+        # Trigger delay sweep range
+        sd_group = QGroupBox("Trigger Delay Sweep (µs)")
+        sd_grid = QGridLayout(sd_group)
+        sd_grid.addWidget(QLabel("Start:"), 0, 0)
+        self.sweep_delay_start = QSpinBox()
+        self.sweep_delay_start.setRange(0, 125)
+        self.sweep_delay_start.setValue(0)
+        self.sweep_delay_start.setSuffix(" µs")
+        sd_grid.addWidget(self.sweep_delay_start, 0, 1)
+        sd_grid.addWidget(QLabel("End:"), 0, 2)
+        self.sweep_delay_end = QSpinBox()
+        self.sweep_delay_end.setRange(0, 125)
+        self.sweep_delay_end.setValue(0)
+        self.sweep_delay_end.setSuffix(" µs")
+        sd_grid.addWidget(self.sweep_delay_end, 0, 3)
+        sd_grid.addWidget(QLabel("Step:"), 0, 4)
+        self.sweep_delay_step = QSpinBox()
+        self.sweep_delay_step.setRange(1, 125)
+        self.sweep_delay_step.setValue(5)
+        self.sweep_delay_step.setSuffix(" µs")
+        sd_grid.addWidget(self.sweep_delay_step, 0, 5)
+        sweep_layout.addWidget(sd_group)
+
         # Sweep test parameters
         st_group = QGroupBox("Test Parameters")
         st_grid = QGridLayout(st_group)
@@ -1064,23 +1188,6 @@ class MainWindow(QMainWindow):
         self.sweep_mode_box.setCurrentText("1")
         st_grid.addWidget(self.sweep_mode_box, 1, 3)
         sweep_layout.addWidget(st_group)
-
-        # Target port
-        target_group = QGroupBox("Target Board Connection")
-        target_layout = QHBoxLayout(target_group)
-        target_layout.addWidget(QLabel("Port:"))
-        self.sweep_target_port = QComboBox()
-        self.sweep_target_port.addItems(["None"] + [p.device for p in serial.tools.list_ports.comports()])
-        target_layout.addWidget(self.sweep_target_port)
-        self.btn_sweep_refresh_ports = QPushButton("⟳")
-        self.btn_sweep_refresh_ports.setFixedWidth(30)
-        target_layout.addWidget(self.btn_sweep_refresh_ports)
-        target_layout.addWidget(QLabel("Baud:"))
-        self.sweep_target_baud = QComboBox()
-        self.sweep_target_baud.addItems(["9600", "19200", "38400", "57600", "115200"])
-        self.sweep_target_baud.setCurrentText("115200")
-        target_layout.addWidget(self.sweep_target_baud)
-        sweep_layout.addWidget(target_group)
 
         # Sweep control buttons
         sweep_ctrl = QHBoxLayout()
@@ -1228,7 +1335,6 @@ class MainWindow(QMainWindow):
         self.btn_sweep_stop.clicked.connect(self.stop_sweep)
         self.btn_sweep_export.clicked.connect(self.export_sweep_csv)
         self.btn_sweep_clear.clicked.connect(self.sweep_results_log.clear)
-        self.btn_sweep_refresh_ports.clicked.connect(self.refresh_sweep_ports)
         self.sweep_worker.progress_signal.connect(self.on_sweep_progress)
         self.sweep_worker.result_signal.connect(self.on_sweep_result)
         self.sweep_worker.sweep_finished.connect(self.on_sweep_finished)
@@ -1651,17 +1757,12 @@ class MainWindow(QMainWindow):
         self.append_fault_log("[INFO] !!! HARDWARE RESET DETECTED !!!")
 
     # ========== SWEEP METHODS ==========
-    def refresh_sweep_ports(self):
-        current = self.sweep_target_port.currentText()
-        self.sweep_target_port.clear()
-        ports = ["None"] + [p.device for p in serial.tools.list_ports.comports()]
-        self.sweep_target_port.addItems(ports)
-        if current in ports:
-            self.sweep_target_port.setCurrentText(current)
-
     def start_sweep(self):
         if not self.api_connected:
             self.append_log("Error: ChipSHOUTER not connected. Connect first.")
+            return
+        if not self.terminal_connected or not self.terminal_worker.is_connected:
+            self.append_log("Error: Serial Terminal must be connected to the target board first.")
             return
         if self.sweep_running:
             return
@@ -1669,9 +1770,11 @@ class MainWindow(QMainWindow):
             self.append_log("Error: No ChipSHOUTER device available.")
             return
 
-        # Pause polling to avoid conflicts
+        # Pause polling & serial timer to avoid conflicts
         self.fault_timer.stop()
         self.arm_state_timer.stop()
+        self.serial_timer.stop()
+        self.stop_repeat_send()
 
         self.sweep_running = True
         self.btn_sweep_start.setEnabled(False)
@@ -1686,28 +1789,31 @@ class MainWindow(QMainWindow):
             'pw_start': self.sweep_pw_start.value(),
             'pw_end': self.sweep_pw_end.value(),
             'pw_step': self.sweep_pw_step.value(),
+            'delay_start': self.sweep_delay_start.value(),
+            'delay_end': self.sweep_delay_end.value(),
+            'delay_step': self.sweep_delay_step.value(),
             'pulses_per_point': self.sweep_pulses.value(),
             'pulse_repeat': self.sweep_repeat.value(),
             'deadtime': self.sweep_deadtime.value(),
             'mode': self.sweep_mode_box.currentText(),
         }
 
-        target_port = self.sweep_target_port.currentText()
-        target_baud = int(self.sweep_target_baud.currentText())
-
         # Calculate total points for progress bar
         v_count = len(range(config['v_start'], config['v_end'] + 1, max(1, config['v_step'])))
         pw_count = len(range(config['pw_start'], config['pw_end'] + 1, max(1, config['pw_step'])))
-        self.sweep_progress.setMaximum(v_count * pw_count)
+        delays = list(range(config['delay_start'], config['delay_end'] + 1, max(1, config['delay_step'])))
+        d_count = max(1, len(delays))
+        self.sweep_progress.setMaximum(v_count * pw_count * d_count)
 
-        self.append_log(f"Sweep started: V[{config['v_start']}-{config['v_end']}] PW[{config['pw_start']}-{config['pw_end']}]")
+        self.append_log(
+            f"Sweep started: V[{config['v_start']}-{config['v_end']}] "
+            f"PW[{config['pw_start']}-{config['pw_end']}] "
+            f"Delay[{config['delay_start']}-{config['delay_end']}µs]")
 
-        # Use QTimer.singleShot to invoke start_sweep on the worker thread
-        from functools import partial
-        QTimer.singleShot(0, partial(
-            self.sweep_worker.start_sweep,
-            self.worker.cs, target_port, target_baud, config
-        ))
+        # Emit signal -> Qt auto-uses QueuedConnection -> runs on sweep_thread
+        self.sweep_worker._start_requested.emit(
+            self.worker.cs, self.terminal_worker.serial_port, config
+        )
 
     def stop_sweep(self):
         self.sweep_worker.stop_sweep()
@@ -1720,13 +1826,18 @@ class MainWindow(QMainWindow):
     def on_sweep_result(self, result):
         v = result['voltage']
         pw = result['pulse_width']
+        d = result.get('delay_us', 0)
         g = result['glitches']
+        r = result.get('resets', 0)
         e = result['errors']
         n = result['normal']
         rate = result['rate']
         if g > 0:
             color = "#ff5252"
             marker = "*** GLITCH ***"
+        elif r > 0:
+            color = "#ff6e40"
+            marker = "RESET"
         elif e > 0:
             color = "#ffab40"
             marker = "ERROR"
@@ -1734,8 +1845,8 @@ class MainWindow(QMainWindow):
             color = "#69f0ae"
             marker = "OK"
         self.sweep_results_log.append(
-            f"<span style='color:{color};'>V={v:>3}V  PW={pw:>3}ns  "
-            f"G:{g} E:{e} N:{n}  Rate:{rate}  [{marker}]</span>"
+            f"<span style='color:{color};'>V={v:>3}V  PW={pw:>3}ns  D={d:>3}µs  "
+            f"G:{g} R:{r} E:{e} N:{n}  Rate:{rate}  [{marker}]</span>"
         )
 
     def on_sweep_finished(self, summary):
@@ -1745,10 +1856,12 @@ class MainWindow(QMainWindow):
         self.sweep_status_label.setText(summary)
         self.append_log(f"Sweep: {summary}")
 
-        # Resume polling
+        # Resume polling and serial timer
         if self.api_connected:
             self.fault_timer.start(3000)
             self.arm_state_timer.start(700)
+        if self.terminal_connected and self.terminal_worker.is_connected:
+            self.serial_timer.start(150)
 
     def on_sweep_log(self, text):
         self.sweep_results_log.append(f"<span style='color:#888;'>[LOG] {text}</span>")
@@ -1771,12 +1884,17 @@ class MainWindow(QMainWindow):
         try:
             with open(file_path, "w", newline="", encoding="utf-8-sig") as f:
                 writer = csv.writer(f)
-                writer.writerow(["voltage_V", "pulse_width_ns", "glitches", "errors", "normal", "total", "glitch_rate"])
+                writer.writerow([
+                    "voltage_V", "pulse_width_ns", "delay_us",
+                    "glitches", "resets", "errors", "normal", "total",
+                    "glitch_rate", "baseline_ct", "last_ct"
+                ])
                 for r in results:
                     writer.writerow([
-                        r['voltage'], r['pulse_width'],
-                        r['glitches'], r['errors'], r['normal'],
-                        r['total'], r['rate']
+                        r['voltage'], r['pulse_width'], r.get('delay_us', 0),
+                        r['glitches'], r.get('resets', 0), r['errors'], r['normal'],
+                        r['total'], r['rate'],
+                        r.get('baseline_ct', ''), r.get('last_ct', '')
                     ])
             self.append_log(f"Sweep CSV exported: {file_path}")
         except Exception as e:
