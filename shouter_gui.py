@@ -6,7 +6,7 @@ import serial.tools.list_ports
 from PySide6.QtWidgets import (QApplication, QMainWindow, QPushButton, QVBoxLayout, 
                              QHBoxLayout, QWidget, QSlider, QLabel, QTextEdit, QComboBox,
                              QSpinBox, QGroupBox, QGridLayout, QLineEdit,
-                             QSplitter, QFrame, QDockWidget, QFileDialog)
+                             QSplitter, QFrame, QDockWidget, QFileDialog, QProgressBar)
 from PySide6.QtCore import QThread, Signal, QObject, Qt, QTimer
 from PySide6.QtGui import QFont, QTextCursor
 from chipshouter import ChipSHOUTER
@@ -386,6 +386,180 @@ class SerialTerminalWorker(QObject):
         finally:
             self.is_reading = False
 
+# --- Sweep Worker: parameter sweep for fault injection ---
+class SweepWorker(QObject):
+    progress_signal = Signal(int, int, str)  # current, total, info
+    result_signal = Signal(dict)
+    sweep_finished = Signal(str)
+    log_signal = Signal(str)
+
+    def __init__(self):
+        super().__init__()
+        self.cs = None
+        self._stop_requested = False
+        self.is_running = False
+        self.results = []
+
+    def start_sweep(self, cs, target_port, target_baud, config):
+        self.cs = cs
+        self._stop_requested = False
+        self.is_running = True
+        self.results = []
+        target_serial = None
+
+        # Connect to target board if port provided
+        if target_port and target_port not in ('', 'None', 'No ports found'):
+            try:
+                target_serial = serial.Serial(port=target_port, baudrate=target_baud, timeout=2)
+                mode = config.get('mode', '1')
+                target_serial.write(f"MODE:{mode}\n".encode())
+                time.sleep(0.5)
+                target_serial.reset_input_buffer()
+                self.log_signal.emit(f"Target connected: {target_port} @ {target_baud}, Mode {mode}")
+            except Exception as e:
+                self.log_signal.emit(f"Target connection error: {e}. Continuing without target.")
+                target_serial = None
+        else:
+            self.log_signal.emit("No target port configured. Pulses will fire without response checking.")
+
+        # Build sweep grid
+        voltages = list(range(config['v_start'], config['v_end'] + 1, max(1, config['v_step'])))
+        pulse_widths = list(range(config['pw_start'], config['pw_end'] + 1, max(1, config['pw_step'])))
+        total = len(voltages) * len(pulse_widths)
+        n_pulses = config.get('pulses_per_point', 5)
+
+        self.log_signal.emit(f"Sweep: {len(voltages)} V x {len(pulse_widths)} PW = {total} points, {n_pulses} pulses/point")
+
+        # Fixed params
+        try:
+            self.cs.pulse.repeat = config.get('pulse_repeat', 1)
+            self.cs.pulse.deadtime = config.get('deadtime', 10)
+            self.cs.mute = 1
+        except Exception as e:
+            self.log_signal.emit(f"Fixed param error: {e}")
+
+        # Get baseline CT from target
+        baseline_ct = None
+        if target_serial:
+            resp = self._target_exchange(target_serial)
+            if resp and 'CT' in resp:
+                baseline_ct = resp['CT']
+                self.log_signal.emit(f"Baseline CT: {baseline_ct}")
+
+        step = 0
+        for v in voltages:
+            if self._stop_requested:
+                break
+            for pw in pulse_widths:
+                if self._stop_requested:
+                    break
+                step += 1
+
+                # Set voltage and pulse width
+                try:
+                    self.cs.voltage = v
+                    self.cs.pulse.width = pw
+                    time.sleep(0.05)
+                except Exception as e:
+                    self.log_signal.emit(f"Config error V={v} PW={pw}: {e}")
+                    continue
+
+                # Arm
+                try:
+                    self.cs.armed = 1
+                    time.sleep(0.2)
+                except Exception as e:
+                    self.log_signal.emit(f"Arm error V={v} PW={pw}: {e}")
+                    continue
+
+                glitch = 0
+                error = 0
+                normal = 0
+
+                for _ in range(n_pulses):
+                    if self._stop_requested:
+                        break
+                    try:
+                        self.cs.pulse = 1
+                        time.sleep(0.05)
+                        if target_serial:
+                            resp = self._target_exchange(target_serial)
+                            if resp is None:
+                                error += 1
+                            elif baseline_ct and resp.get('CT') != baseline_ct:
+                                glitch += 1
+                            else:
+                                normal += 1
+                        else:
+                            normal += 1
+                    except Exception:
+                        error += 1
+
+                # Disarm after each point
+                try:
+                    self.cs.armed = 0
+                except Exception:
+                    pass
+
+                result = {
+                    'voltage': v, 'pulse_width': pw,
+                    'glitches': glitch, 'errors': error, 'normal': normal,
+                    'total': n_pulses,
+                    'rate': f"{glitch / n_pulses * 100:.1f}%" if n_pulses > 0 else "0%"
+                }
+                self.results.append(result)
+                self.result_signal.emit(result)
+
+                tag = "GLITCH" if glitch > 0 else ("ERROR" if error > 0 else "Normal")
+                self.progress_signal.emit(step, total,
+                    f"[{step}/{total}] V={v}V PW={pw}ns -> {tag} (G:{glitch} E:{error} N:{normal})")
+                time.sleep(0.1)
+
+        # Cleanup
+        try:
+            self.cs.armed = 0
+        except Exception:
+            pass
+        if target_serial and target_serial.is_open:
+            target_serial.close()
+
+        self.is_running = False
+        total_g = sum(r['glitches'] for r in self.results)
+        sensitive = len([r for r in self.results if r['glitches'] > 0])
+        prefix = 'STOPPED' if self._stop_requested else 'COMPLETE'
+        self.sweep_finished.emit(f"{prefix}: {step}/{total} points, {total_g} glitches in {sensitive} sensitive points")
+
+    def _target_exchange(self, ser):
+        """Send START to target board and parse DATA_START/DATA_END response."""
+        try:
+            ser.reset_input_buffer()
+            ser.write(b"START\n")
+            data = {}
+            collecting = False
+            t0 = time.time()
+            while (time.time() - t0) < 2.0:
+                line = ser.readline().decode('utf-8', errors='ignore').strip()
+                if "--- DATA_START ---" in line:
+                    collecting = True
+                    continue
+                if "--- DATA_END ---" in line:
+                    return data
+                if "ERROR:" in line:
+                    return None
+                if collecting and ":" in line:
+                    parts = line.split(":", 1)
+                    if len(parts) == 2:
+                        data[parts[0].strip()] = parts[1].strip()
+                if not line and collecting:
+                    break
+            return data if data else None
+        except Exception:
+            return None
+
+    def stop_sweep(self):
+        self._stop_requested = True
+
+
 # --- 主界面 (Ventana Principal) ---
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -438,6 +612,13 @@ class MainWindow(QMainWindow):
         self.api_operation_timeout = QTimer(self)
         self.api_operation_timeout.setSingleShot(True)
         self.api_operation_timeout.timeout.connect(self.on_api_operation_timeout)
+
+        # Sweep worker
+        self.sweep_worker = SweepWorker()
+        self.sweep_thread = QThread()
+        self.sweep_worker.moveToThread(self.sweep_thread)
+        self.sweep_thread.start()
+        self.sweep_running = False
 
         self.apply_dark_theme()
         self.setup_ui()
@@ -577,12 +758,13 @@ class MainWindow(QMainWindow):
         self.voltage_slider = QSlider(Qt.Horizontal)
         self.voltage_slider.setRange(150, 500)
         self.voltage_slider.setValue(300)
-        self.voltage_label = QLabel("300 V")
-        self.voltage_label.setFixedWidth(80)
-        self.voltage_label.setAlignment(Qt.AlignCenter)
-        self.voltage_slider.valueChanged.connect(lambda v: self.voltage_label.setText(f"{v} V"))
+        self.voltage_edit = QLineEdit("300")
+        self.voltage_edit.setFixedWidth(80)
+        self.voltage_edit.setAlignment(Qt.AlignCenter)
+        self.voltage_slider.valueChanged.connect(lambda v: self.voltage_edit.setText(str(v)))
+        self.voltage_edit.editingFinished.connect(lambda: self._sync_edit_to_slider(self.voltage_edit, self.voltage_slider))
         config_grid.addWidget(self.voltage_slider, 0, 1)
-        config_grid.addWidget(self.voltage_label, 0, 2)
+        config_grid.addWidget(self.voltage_edit, 0, 2)
         self.btn_set_voltage = QPushButton("Set")
         config_grid.addWidget(self.btn_set_voltage, 0, 3)
 
@@ -591,12 +773,13 @@ class MainWindow(QMainWindow):
         self.pulse_width_slider = QSlider(Qt.Horizontal)
         self.pulse_width_slider.setRange(80, 960)
         self.pulse_width_slider.setValue(160)
-        self.pulse_width_label = QLabel("160 ns")
-        self.pulse_width_label.setFixedWidth(80)
-        self.pulse_width_label.setAlignment(Qt.AlignCenter)
-        self.pulse_width_slider.valueChanged.connect(lambda v: self.pulse_width_label.setText(f"{v} ns"))
+        self.pulse_width_edit = QLineEdit("160")
+        self.pulse_width_edit.setFixedWidth(80)
+        self.pulse_width_edit.setAlignment(Qt.AlignCenter)
+        self.pulse_width_slider.valueChanged.connect(lambda v: self.pulse_width_edit.setText(str(v)))
+        self.pulse_width_edit.editingFinished.connect(lambda: self._sync_edit_to_slider(self.pulse_width_edit, self.pulse_width_slider))
         config_grid.addWidget(self.pulse_width_slider, 1, 1)
-        config_grid.addWidget(self.pulse_width_label, 1, 2)
+        config_grid.addWidget(self.pulse_width_edit, 1, 2)
         self.btn_set_width = QPushButton("Set")
         config_grid.addWidget(self.btn_set_width, 1, 3)
 
@@ -605,12 +788,13 @@ class MainWindow(QMainWindow):
         self.pulse_repeat_slider = QSlider(Qt.Horizontal)
         self.pulse_repeat_slider.setRange(1, 10000)
         self.pulse_repeat_slider.setValue(1)
-        self.pulse_repeat_label = QLabel("1")
-        self.pulse_repeat_label.setFixedWidth(80)
-        self.pulse_repeat_label.setAlignment(Qt.AlignCenter)
-        self.pulse_repeat_slider.valueChanged.connect(lambda v: self.pulse_repeat_label.setText(str(v)))
+        self.pulse_repeat_edit = QLineEdit("1")
+        self.pulse_repeat_edit.setFixedWidth(80)
+        self.pulse_repeat_edit.setAlignment(Qt.AlignCenter)
+        self.pulse_repeat_slider.valueChanged.connect(lambda v: self.pulse_repeat_edit.setText(str(v)))
+        self.pulse_repeat_edit.editingFinished.connect(lambda: self._sync_edit_to_slider(self.pulse_repeat_edit, self.pulse_repeat_slider))
         config_grid.addWidget(self.pulse_repeat_slider, 2, 1)
-        config_grid.addWidget(self.pulse_repeat_label, 2, 2)
+        config_grid.addWidget(self.pulse_repeat_edit, 2, 2)
         self.btn_set_repeat = QPushButton("Set")
         config_grid.addWidget(self.btn_set_repeat, 2, 3)
 
@@ -619,12 +803,13 @@ class MainWindow(QMainWindow):
         self.deadtime_slider = QSlider(Qt.Horizontal)
         self.deadtime_slider.setRange(1, 1000)
         self.deadtime_slider.setValue(10)
-        self.deadtime_label = QLabel("10 ms")
-        self.deadtime_label.setFixedWidth(80)
-        self.deadtime_label.setAlignment(Qt.AlignCenter)
-        self.deadtime_slider.valueChanged.connect(lambda v: self.deadtime_label.setText(f"{v} ms"))
+        self.deadtime_edit = QLineEdit("10")
+        self.deadtime_edit.setFixedWidth(80)
+        self.deadtime_edit.setAlignment(Qt.AlignCenter)
+        self.deadtime_slider.valueChanged.connect(lambda v: self.deadtime_edit.setText(str(v)))
+        self.deadtime_edit.editingFinished.connect(lambda: self._sync_edit_to_slider(self.deadtime_edit, self.deadtime_slider))
         config_grid.addWidget(self.deadtime_slider, 3, 1)
-        config_grid.addWidget(self.deadtime_label, 3, 2)
+        config_grid.addWidget(self.deadtime_edit, 3, 2)
         self.btn_set_deadtime = QPushButton("Set")
         config_grid.addWidget(self.btn_set_deadtime, 3, 3)
 
@@ -804,10 +989,151 @@ class MainWindow(QMainWindow):
         self.dock_terminal_mode.setWidget(terminal_tab)
         self.addDockWidget(Qt.RightDockWidgetArea, self.dock_terminal_mode)
 
+        # ========== SWEEP SCAN PANEL ==========
+        sweep_tab = QWidget()
+        sweep_layout = QVBoxLayout(sweep_tab)
+
+        # Sweep voltage range
+        sv_group = QGroupBox("Voltage Sweep (V)")
+        sv_grid = QGridLayout(sv_group)
+        sv_grid.addWidget(QLabel("Start:"), 0, 0)
+        self.sweep_v_start = QSpinBox()
+        self.sweep_v_start.setRange(150, 500)
+        self.sweep_v_start.setValue(200)
+        self.sweep_v_start.setSuffix(" V")
+        sv_grid.addWidget(self.sweep_v_start, 0, 1)
+        sv_grid.addWidget(QLabel("End:"), 0, 2)
+        self.sweep_v_end = QSpinBox()
+        self.sweep_v_end.setRange(150, 500)
+        self.sweep_v_end.setValue(500)
+        self.sweep_v_end.setSuffix(" V")
+        sv_grid.addWidget(self.sweep_v_end, 0, 3)
+        sv_grid.addWidget(QLabel("Step:"), 0, 4)
+        self.sweep_v_step = QSpinBox()
+        self.sweep_v_step.setRange(1, 350)
+        self.sweep_v_step.setValue(50)
+        self.sweep_v_step.setSuffix(" V")
+        sv_grid.addWidget(self.sweep_v_step, 0, 5)
+        sweep_layout.addWidget(sv_group)
+
+        # Sweep pulse width range
+        sp_group = QGroupBox("Pulse Width Sweep (ns)")
+        sp_grid = QGridLayout(sp_group)
+        sp_grid.addWidget(QLabel("Start:"), 0, 0)
+        self.sweep_pw_start = QSpinBox()
+        self.sweep_pw_start.setRange(80, 960)
+        self.sweep_pw_start.setValue(80)
+        self.sweep_pw_start.setSuffix(" ns")
+        sp_grid.addWidget(self.sweep_pw_start, 0, 1)
+        sp_grid.addWidget(QLabel("End:"), 0, 2)
+        self.sweep_pw_end = QSpinBox()
+        self.sweep_pw_end.setRange(80, 960)
+        self.sweep_pw_end.setValue(480)
+        self.sweep_pw_end.setSuffix(" ns")
+        sp_grid.addWidget(self.sweep_pw_end, 0, 3)
+        sp_grid.addWidget(QLabel("Step:"), 0, 4)
+        self.sweep_pw_step = QSpinBox()
+        self.sweep_pw_step.setRange(1, 880)
+        self.sweep_pw_step.setValue(40)
+        self.sweep_pw_step.setSuffix(" ns")
+        sp_grid.addWidget(self.sweep_pw_step, 0, 5)
+        sweep_layout.addWidget(sp_group)
+
+        # Sweep test parameters
+        st_group = QGroupBox("Test Parameters")
+        st_grid = QGridLayout(st_group)
+        st_grid.addWidget(QLabel("Pulses/Point:"), 0, 0)
+        self.sweep_pulses = QSpinBox()
+        self.sweep_pulses.setRange(1, 1000)
+        self.sweep_pulses.setValue(5)
+        st_grid.addWidget(self.sweep_pulses, 0, 1)
+        st_grid.addWidget(QLabel("Pulse Repeat:"), 0, 2)
+        self.sweep_repeat = QSpinBox()
+        self.sweep_repeat.setRange(1, 10000)
+        self.sweep_repeat.setValue(1)
+        st_grid.addWidget(self.sweep_repeat, 0, 3)
+        st_grid.addWidget(QLabel("Deadtime (ms):"), 1, 0)
+        self.sweep_deadtime = QSpinBox()
+        self.sweep_deadtime.setRange(1, 1000)
+        self.sweep_deadtime.setValue(10)
+        self.sweep_deadtime.setSuffix(" ms")
+        st_grid.addWidget(self.sweep_deadtime, 1, 1)
+        st_grid.addWidget(QLabel("Target Mode:"), 1, 2)
+        self.sweep_mode_box = QComboBox()
+        self.sweep_mode_box.addItems(["1", "2", "3", "4"])
+        self.sweep_mode_box.setCurrentText("1")
+        st_grid.addWidget(self.sweep_mode_box, 1, 3)
+        sweep_layout.addWidget(st_group)
+
+        # Target port
+        target_group = QGroupBox("Target Board Connection")
+        target_layout = QHBoxLayout(target_group)
+        target_layout.addWidget(QLabel("Port:"))
+        self.sweep_target_port = QComboBox()
+        self.sweep_target_port.addItems(["None"] + [p.device for p in serial.tools.list_ports.comports()])
+        target_layout.addWidget(self.sweep_target_port)
+        self.btn_sweep_refresh_ports = QPushButton("⟳")
+        self.btn_sweep_refresh_ports.setFixedWidth(30)
+        target_layout.addWidget(self.btn_sweep_refresh_ports)
+        target_layout.addWidget(QLabel("Baud:"))
+        self.sweep_target_baud = QComboBox()
+        self.sweep_target_baud.addItems(["9600", "19200", "38400", "57600", "115200"])
+        self.sweep_target_baud.setCurrentText("115200")
+        target_layout.addWidget(self.sweep_target_baud)
+        sweep_layout.addWidget(target_group)
+
+        # Sweep control buttons
+        sweep_ctrl = QHBoxLayout()
+        self.btn_sweep_start = QPushButton("▶ Start Sweep")
+        self.btn_sweep_start.setStyleSheet("background-color: #00695c; color: white; font-weight: bold; font-size: 14px;")
+        self.btn_sweep_start.setFixedHeight(40)
+        self.btn_sweep_stop = QPushButton("■ Stop")
+        self.btn_sweep_stop.setStyleSheet("background-color: #b71c1c; color: white; font-weight: bold; font-size: 14px;")
+        self.btn_sweep_stop.setFixedHeight(40)
+        self.btn_sweep_stop.setEnabled(False)
+        sweep_ctrl.addWidget(self.btn_sweep_start)
+        sweep_ctrl.addWidget(self.btn_sweep_stop)
+        sweep_layout.addLayout(sweep_ctrl)
+
+        # Progress
+        self.sweep_progress = QProgressBar()
+        self.sweep_progress.setValue(0)
+        self.sweep_progress.setFormat("%v / %m  (%p%)")
+        sweep_layout.addWidget(self.sweep_progress)
+        self.sweep_status_label = QLabel("Ready")
+        self.sweep_status_label.setStyleSheet("color: #aaa;")
+        sweep_layout.addWidget(self.sweep_status_label)
+
+        # Sweep results log
+        self.sweep_results_log = QTextEdit()
+        self.sweep_results_log.setReadOnly(True)
+        self.sweep_results_log.setFont(QFont("Consolas", 9))
+        self.sweep_results_log.setStyleSheet("background-color: #1e1e1e; color: #00ff00;")
+        sweep_layout.addWidget(self.sweep_results_log)
+
+        # Export
+        sweep_export_layout = QHBoxLayout()
+        self.btn_sweep_export = QPushButton("Export Sweep CSV")
+        self.btn_sweep_export.setStyleSheet("background-color: #1565c0; color: white;")
+        self.btn_sweep_clear = QPushButton("Clear")
+        sweep_export_layout.addWidget(self.btn_sweep_export)
+        sweep_export_layout.addWidget(self.btn_sweep_clear)
+        sweep_export_layout.addStretch()
+        sweep_layout.addLayout(sweep_export_layout)
+
+        self.dock_sweep = QDockWidget("Sweep Scan", self)
+        self.dock_sweep.setObjectName("dock_sweep")
+        self.dock_sweep.setAllowedAreas(Qt.RightDockWidgetArea)
+        self.dock_sweep.setFeatures(QDockWidget.NoDockWidgetFeatures)
+        self.dock_sweep.setWidget(sweep_tab)
+        self.addDockWidget(Qt.RightDockWidgetArea, self.dock_sweep)
+
         self.setup_docks()
 
-        # Force 3-block layout: top-left basic, top-right terminal, bottom log area
+        # Force 3-block layout: top-left basic, top-right terminal+sweep tabs, bottom log
         self.splitDockWidget(self.dock_basic_mode, self.dock_terminal_mode, Qt.Horizontal)
+        self.tabifyDockWidget(self.dock_terminal_mode, self.dock_sweep)
+        self.dock_terminal_mode.raise_()
         self.splitDockWidget(self.dock_basic_mode, self.dock_log, Qt.Vertical)
         self.dock_log.raise_()
 
@@ -897,6 +1223,17 @@ class MainWindow(QMainWindow):
         self.btn_clear_faults.clicked.connect(self.worker.request_clear_faults.emit)
         self.btn_clear_event_log.clicked.connect(self.log_view_basic.clear)
 
+        # Sweep controls
+        self.btn_sweep_start.clicked.connect(self.start_sweep)
+        self.btn_sweep_stop.clicked.connect(self.stop_sweep)
+        self.btn_sweep_export.clicked.connect(self.export_sweep_csv)
+        self.btn_sweep_clear.clicked.connect(self.sweep_results_log.clear)
+        self.btn_sweep_refresh_ports.clicked.connect(self.refresh_sweep_ports)
+        self.sweep_worker.progress_signal.connect(self.on_sweep_progress)
+        self.sweep_worker.result_signal.connect(self.on_sweep_result)
+        self.sweep_worker.sweep_finished.connect(self.on_sweep_finished)
+        self.sweep_worker.log_signal.connect(self.on_sweep_log)
+
         # ChipSHOUTER Worker signals
         self.worker.log_signal.connect(self.append_log)
         self.worker.status_signal.connect(self.update_status)
@@ -924,6 +1261,15 @@ class MainWindow(QMainWindow):
         self.btn_set_hwtrig_term.setEnabled(controls_enabled)
         self.btn_reset_device.setEnabled(controls_enabled)
         self.btn_apply_all.setEnabled(controls_enabled)
+
+    def _sync_edit_to_slider(self, edit, slider):
+        """Sync a QLineEdit value back to its paired QSlider, clamping to range."""
+        try:
+            val = int(edit.text())
+            val = max(slider.minimum(), min(slider.maximum(), val))
+            slider.setValue(val)
+        except ValueError:
+            edit.setText(str(slider.value()))
 
     def update_mute_button_appearance(self, muted):
         if muted:
@@ -1304,7 +1650,144 @@ class MainWindow(QMainWindow):
         self.append_log("!!! RESET DETECTADO !!! Re-iniciando en 5s...")
         self.append_fault_log("[INFO] !!! HARDWARE RESET DETECTED !!!")
 
+    # ========== SWEEP METHODS ==========
+    def refresh_sweep_ports(self):
+        current = self.sweep_target_port.currentText()
+        self.sweep_target_port.clear()
+        ports = ["None"] + [p.device for p in serial.tools.list_ports.comports()]
+        self.sweep_target_port.addItems(ports)
+        if current in ports:
+            self.sweep_target_port.setCurrentText(current)
+
+    def start_sweep(self):
+        if not self.api_connected:
+            self.append_log("Error: ChipSHOUTER not connected. Connect first.")
+            return
+        if self.sweep_running:
+            return
+        if not self.worker.cs:
+            self.append_log("Error: No ChipSHOUTER device available.")
+            return
+
+        # Pause polling to avoid conflicts
+        self.fault_timer.stop()
+        self.arm_state_timer.stop()
+
+        self.sweep_running = True
+        self.btn_sweep_start.setEnabled(False)
+        self.btn_sweep_stop.setEnabled(True)
+        self.sweep_results_log.clear()
+        self.sweep_progress.setValue(0)
+
+        config = {
+            'v_start': self.sweep_v_start.value(),
+            'v_end': self.sweep_v_end.value(),
+            'v_step': self.sweep_v_step.value(),
+            'pw_start': self.sweep_pw_start.value(),
+            'pw_end': self.sweep_pw_end.value(),
+            'pw_step': self.sweep_pw_step.value(),
+            'pulses_per_point': self.sweep_pulses.value(),
+            'pulse_repeat': self.sweep_repeat.value(),
+            'deadtime': self.sweep_deadtime.value(),
+            'mode': self.sweep_mode_box.currentText(),
+        }
+
+        target_port = self.sweep_target_port.currentText()
+        target_baud = int(self.sweep_target_baud.currentText())
+
+        # Calculate total points for progress bar
+        v_count = len(range(config['v_start'], config['v_end'] + 1, max(1, config['v_step'])))
+        pw_count = len(range(config['pw_start'], config['pw_end'] + 1, max(1, config['pw_step'])))
+        self.sweep_progress.setMaximum(v_count * pw_count)
+
+        self.append_log(f"Sweep started: V[{config['v_start']}-{config['v_end']}] PW[{config['pw_start']}-{config['pw_end']}]")
+
+        # Use QTimer.singleShot to invoke start_sweep on the worker thread
+        from functools import partial
+        QTimer.singleShot(0, partial(
+            self.sweep_worker.start_sweep,
+            self.worker.cs, target_port, target_baud, config
+        ))
+
+    def stop_sweep(self):
+        self.sweep_worker.stop_sweep()
+        self.sweep_status_label.setText("Stopping...")
+
+    def on_sweep_progress(self, current, total, info):
+        self.sweep_progress.setValue(current)
+        self.sweep_status_label.setText(info)
+
+    def on_sweep_result(self, result):
+        v = result['voltage']
+        pw = result['pulse_width']
+        g = result['glitches']
+        e = result['errors']
+        n = result['normal']
+        rate = result['rate']
+        if g > 0:
+            color = "#ff5252"
+            marker = "*** GLITCH ***"
+        elif e > 0:
+            color = "#ffab40"
+            marker = "ERROR"
+        else:
+            color = "#69f0ae"
+            marker = "OK"
+        self.sweep_results_log.append(
+            f"<span style='color:{color};'>V={v:>3}V  PW={pw:>3}ns  "
+            f"G:{g} E:{e} N:{n}  Rate:{rate}  [{marker}]</span>"
+        )
+
+    def on_sweep_finished(self, summary):
+        self.sweep_running = False
+        self.btn_sweep_start.setEnabled(True)
+        self.btn_sweep_stop.setEnabled(False)
+        self.sweep_status_label.setText(summary)
+        self.append_log(f"Sweep: {summary}")
+
+        # Resume polling
+        if self.api_connected:
+            self.fault_timer.start(3000)
+            self.arm_state_timer.start(700)
+
+    def on_sweep_log(self, text):
+        self.sweep_results_log.append(f"<span style='color:#888;'>[LOG] {text}</span>")
+        self.append_log(f"[Sweep] {text}")
+
+    def export_sweep_csv(self):
+        results = self.sweep_worker.results
+        if not results:
+            self.append_log("No sweep data to export.")
+            return
+
+        default_file = f"sweep_results_{time.strftime('%Y%m%d_%H%M%S')}.csv"
+        file_path, _ = QFileDialog.getSaveFileName(
+            self, "Export Sweep Results", default_file,
+            "CSV Files (*.csv);;All Files (*)"
+        )
+        if not file_path:
+            return
+
+        try:
+            with open(file_path, "w", newline="", encoding="utf-8-sig") as f:
+                writer = csv.writer(f)
+                writer.writerow(["voltage_V", "pulse_width_ns", "glitches", "errors", "normal", "total", "glitch_rate"])
+                for r in results:
+                    writer.writerow([
+                        r['voltage'], r['pulse_width'],
+                        r['glitches'], r['errors'], r['normal'],
+                        r['total'], r['rate']
+                    ])
+            self.append_log(f"Sweep CSV exported: {file_path}")
+        except Exception as e:
+            self.append_log(f"Error exporting sweep CSV: {e}")
+
     def closeEvent(self, event):
+        # Stop sweep if running
+        if self.sweep_running:
+            self.sweep_worker.stop_sweep()
+        self.sweep_thread.quit()
+        self.sweep_thread.wait()
         # Stop timers
         self.serial_timer.stop()
         self.repeat_send_timer.stop()
