@@ -574,42 +574,59 @@ class MainWindow(QMainWindow):
 
         # Voltage
         config_grid.addWidget(QLabel("Voltage (V):"), 0, 0)
-        self.voltage_spin = QSpinBox()
-        self.voltage_spin.setRange(150, 500)
-        self.voltage_spin.setValue(300)
-        self.voltage_spin.setSuffix(" V")
-        config_grid.addWidget(self.voltage_spin, 0, 1)
+        self.voltage_slider = QSlider(Qt.Horizontal)
+        self.voltage_slider.setRange(150, 500)
+        self.voltage_slider.setValue(300)
+        self.voltage_label = QLabel("300 V")
+        self.voltage_label.setFixedWidth(80)
+        self.voltage_label.setAlignment(Qt.AlignCenter)
+        self.voltage_slider.valueChanged.connect(lambda v: self.voltage_label.setText(f"{v} V"))
+        config_grid.addWidget(self.voltage_slider, 0, 1)
+        config_grid.addWidget(self.voltage_label, 0, 2)
         self.btn_set_voltage = QPushButton("Set")
-        config_grid.addWidget(self.btn_set_voltage, 0, 2)
+        config_grid.addWidget(self.btn_set_voltage, 0, 3)
 
         # Pulse Width
         config_grid.addWidget(QLabel("Pulse Width (ns):"), 1, 0)
-        self.pulse_width_spin = QSpinBox()
-        self.pulse_width_spin.setRange(10, 500)
-        self.pulse_width_spin.setValue(160)
-        self.pulse_width_spin.setSuffix(" ns")
-        config_grid.addWidget(self.pulse_width_spin, 1, 1)
+        self.pulse_width_slider = QSlider(Qt.Horizontal)
+        self.pulse_width_slider.setRange(80, 960)
+        self.pulse_width_slider.setValue(160)
+        self.pulse_width_label = QLabel("160 ns")
+        self.pulse_width_label.setFixedWidth(80)
+        self.pulse_width_label.setAlignment(Qt.AlignCenter)
+        self.pulse_width_slider.valueChanged.connect(lambda v: self.pulse_width_label.setText(f"{v} ns"))
+        config_grid.addWidget(self.pulse_width_slider, 1, 1)
+        config_grid.addWidget(self.pulse_width_label, 1, 2)
         self.btn_set_width = QPushButton("Set")
-        config_grid.addWidget(self.btn_set_width, 1, 2)
+        config_grid.addWidget(self.btn_set_width, 1, 3)
 
         # Pulse Repeat
         config_grid.addWidget(QLabel("Pulse Repeat:"), 2, 0)
-        self.pulse_repeat_spin = QSpinBox()
-        self.pulse_repeat_spin.setRange(1, 100)
-        self.pulse_repeat_spin.setValue(10)
-        config_grid.addWidget(self.pulse_repeat_spin, 2, 1)
+        self.pulse_repeat_slider = QSlider(Qt.Horizontal)
+        self.pulse_repeat_slider.setRange(1, 10000)
+        self.pulse_repeat_slider.setValue(1)
+        self.pulse_repeat_label = QLabel("1")
+        self.pulse_repeat_label.setFixedWidth(80)
+        self.pulse_repeat_label.setAlignment(Qt.AlignCenter)
+        self.pulse_repeat_slider.valueChanged.connect(lambda v: self.pulse_repeat_label.setText(str(v)))
+        config_grid.addWidget(self.pulse_repeat_slider, 2, 1)
+        config_grid.addWidget(self.pulse_repeat_label, 2, 2)
         self.btn_set_repeat = QPushButton("Set")
-        config_grid.addWidget(self.btn_set_repeat, 2, 2)
+        config_grid.addWidget(self.btn_set_repeat, 2, 3)
 
         # Deadtime
         config_grid.addWidget(QLabel("Deadtime (ms):"), 3, 0)
-        self.deadtime_spin = QSpinBox()
-        self.deadtime_spin.setRange(1, 1000)
-        self.deadtime_spin.setValue(10)
-        self.deadtime_spin.setSuffix(" ms")
-        config_grid.addWidget(self.deadtime_spin, 3, 1)
+        self.deadtime_slider = QSlider(Qt.Horizontal)
+        self.deadtime_slider.setRange(1, 1000)
+        self.deadtime_slider.setValue(10)
+        self.deadtime_label = QLabel("10 ms")
+        self.deadtime_label.setFixedWidth(80)
+        self.deadtime_label.setAlignment(Qt.AlignCenter)
+        self.deadtime_slider.valueChanged.connect(lambda v: self.deadtime_label.setText(f"{v} ms"))
+        config_grid.addWidget(self.deadtime_slider, 3, 1)
+        config_grid.addWidget(self.deadtime_label, 3, 2)
         self.btn_set_deadtime = QPushButton("Set")
-        config_grid.addWidget(self.btn_set_deadtime, 3, 2)
+        config_grid.addWidget(self.btn_set_deadtime, 3, 3)
 
         # HW Trigger Mode
         config_grid.addWidget(QLabel("HW Trigger Mode:"), 4, 0)
@@ -622,7 +639,7 @@ class MainWindow(QMainWindow):
         # HW Trigger Termination
         config_grid.addWidget(QLabel("HW Trigger Term:"), 5, 0)
         self.hwtrig_term_box = QComboBox()
-        self.hwtrig_term_box.addItems(["50-ohm", "High Impedance (~1.8K)"])
+        self.hwtrig_term_box.addItems(["High Impedance (~1.8K)","50-ohm"])
         config_grid.addWidget(self.hwtrig_term_box, 5, 1)
         self.btn_set_hwtrig_term = QPushButton("Set")
         config_grid.addWidget(self.btn_set_hwtrig_term, 5, 2)
@@ -642,8 +659,13 @@ class MainWindow(QMainWindow):
         # Action Buttons
         action_group = QGroupBox("Actions")
         action_layout = QHBoxLayout(action_group)
-        self.btn_arm = QPushButton("ARM DEVICE")
-        self.btn_arm.setStyleSheet("background-color: #c62828; color: white; font-weight: 900; border: 2px solid #ff8a80;")
+        self.btn_arm = QPushButton("ARM")
+        self.btn_arm.setStyleSheet(
+            "QPushButton {background-color: #c62828; color: white; font-weight: 900; "
+            "font-size: 14px; border: 2px solid #ff8a80;}"
+            "QPushButton:disabled {background-color: #c62828; color: white; font-weight: 900; "
+            "font-size: 14px; border: 2px solid #ff8a80;}"
+        )
         self.btn_arm.setFixedHeight(50)
         self.btn_disarm = QPushButton("DISARM")
         self.btn_disarm.setStyleSheet("background-color: #1b5e20; font-weight: 900; color: white; border: 1px solid #66bb6a;")
@@ -836,10 +858,10 @@ class MainWindow(QMainWindow):
         self.btn_refresh_ports.clicked.connect(self.refresh_ports)
 
         # Basic mode - Configuration
-        self.btn_set_voltage.clicked.connect(lambda: self.worker.request_set_voltage.emit(self.voltage_spin.value()))
-        self.btn_set_width.clicked.connect(lambda: self.worker.request_set_pulse_width.emit(self.pulse_width_spin.value()))
-        self.btn_set_repeat.clicked.connect(lambda: self.worker.request_set_pulse_repeat.emit(self.pulse_repeat_spin.value()))
-        self.btn_set_deadtime.clicked.connect(lambda: self.worker.request_set_deadtime.emit(self.deadtime_spin.value()))
+        self.btn_set_voltage.clicked.connect(lambda: self.worker.request_set_voltage.emit(self.voltage_slider.value()))
+        self.btn_set_width.clicked.connect(lambda: self.worker.request_set_pulse_width.emit(self.pulse_width_slider.value()))
+        self.btn_set_repeat.clicked.connect(lambda: self.worker.request_set_pulse_repeat.emit(self.pulse_repeat_slider.value()))
+        self.btn_set_deadtime.clicked.connect(lambda: self.worker.request_set_deadtime.emit(self.deadtime_slider.value()))
         self.btn_apply_all.clicked.connect(self.apply_all_settings)
         self.btn_set_hwtrig_mode.clicked.connect(lambda: self.worker.request_set_hwtrig_mode.emit(self.hwtrig_mode_box.currentIndex() == 0))
         self.btn_set_hwtrig_term.clicked.connect(lambda: self.worker.request_set_hwtrig_term.emit(self.hwtrig_term_box.currentIndex() == 0))
@@ -905,7 +927,7 @@ class MainWindow(QMainWindow):
 
     def update_mute_button_appearance(self, muted):
         if muted:
-            self.btn_mute.setText("UNMUTE SOUND")
+            self.btn_mute.setText("MUTE SOUND")
         else:
             self.btn_mute.setText("MUTE SOUND")
 
@@ -932,26 +954,30 @@ class MainWindow(QMainWindow):
     def on_api_armed_changed(self, armed):
         self.api_armed = armed
         if armed:
-            self.btn_arm.setText("⚠ ARMED")
+            self.btn_arm.setText("ARM")
             self.btn_arm.setStyleSheet(
-                "background-color: #ff1744; color: #fff59d; font-weight: 900; "
-                "font-size: 16px; border: 3px solid #ffff00;"
+                "QPushButton {background-color: #c62828; color: white; font-weight: 900; "
+                "font-size: 14px; border: 3px solid #ffff00;}"
+                "QPushButton:disabled {background-color: #c62828; color: white; font-weight: 900; "
+                "font-size: 14px; border: 3px solid #ffff00;}"
             )
-            self.btn_disarm.setText("SAFE DISARM")
+            self.btn_disarm.setText("DISARM")
             self.btn_disarm.setStyleSheet(
                 "background-color: #00c853; color: black; font-weight: 900; "
                 "font-size: 14px; border: 2px solid #69f0ae;"
             )
         else:
-            self.btn_arm.setText("ARM DEVICE")
+            self.btn_arm.setText("ARM")
             self.btn_arm.setStyleSheet(
-                "background-color: #c62828; color: white; font-weight: 900; "
-                "font-size: 14px; border: 2px solid #ff8a80;"
+                "QPushButton {background-color: #c62828; color: white; font-weight: 900; "
+                "font-size: 14px; border: 2px solid #ff8a80;}"
+                "QPushButton:disabled {background-color: #c62828; color: white; font-weight: 900; "
+                "font-size: 14px; border: 2px solid #ff8a80;}"
             )
             self.btn_disarm.setText("DISARM")
             self.btn_disarm.setStyleSheet(
                 "background-color: #1b5e20; color: white; font-weight: 900; "
-                "font-size: 13px; border: 1px solid #66bb6a;"
+                "font-size: 14px; border: 2px solid #66bb6a;"
             )
         self.refresh_action_buttons()
 
@@ -1065,10 +1091,10 @@ class MainWindow(QMainWindow):
             self.btn_connect.setToolTip("")
 
     def apply_all_settings(self):
-        self.worker.request_set_voltage.emit(self.voltage_spin.value())
-        self.worker.request_set_pulse_width.emit(self.pulse_width_spin.value())
-        self.worker.request_set_pulse_repeat.emit(self.pulse_repeat_spin.value())
-        self.worker.request_set_deadtime.emit(self.deadtime_spin.value())
+        self.worker.request_set_voltage.emit(self.voltage_slider.value())
+        self.worker.request_set_pulse_width.emit(self.pulse_width_slider.value())
+        self.worker.request_set_pulse_repeat.emit(self.pulse_repeat_slider.value())
+        self.worker.request_set_deadtime.emit(self.deadtime_slider.value())
         self.worker.request_set_hwtrig_mode.emit(self.hwtrig_mode_box.currentIndex() == 0)
         self.worker.request_set_hwtrig_term.emit(self.hwtrig_term_box.currentIndex() == 0)
 
