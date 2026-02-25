@@ -403,6 +403,7 @@ class SweepWorker(QObject):
         self._stop_requested = False
         self.is_running = False
         self.results = []
+        self._warned_no_trigger_offset = False
 
     # ---- public API ----
     def start_sweep(self, cs, target_serial, config):
@@ -415,6 +416,7 @@ class SweepWorker(QObject):
         self.is_running = True
         self.results = []
         self.reset_count = 0
+        self._warned_no_trigger_offset = False
 
         if not target_serial or not target_serial.is_open:
             self.log_signal.emit("ERROR: Serial Terminal must be connected to the target board.")
@@ -458,6 +460,18 @@ class SweepWorker(QObject):
         if baseline_ct is None and not self._stop_requested:
             self.log_signal.emit("WARNING: Could not obtain baseline CT. Glitch detection may be inaccurate.")
 
+        # ---- ARM once before sweep loop ----
+        armed_ok = False
+        try:
+            self.cs.armed = 1
+            time.sleep(0.3)
+            armed_ok = True
+            self.log_signal.emit("Device armed – starting sweep loop")
+        except Reset_Exception:
+            self.log_signal.emit("ChipSHOUTER reset on initial ARM")
+        except Exception as e:
+            self.log_signal.emit(f"Initial arm error: {e}")
+
         step = 0
         for v in voltages:
             if self._stop_requested:
@@ -470,31 +484,41 @@ class SweepWorker(QObject):
                         break
                     step += 1
 
-                    # ---- Configure ChipSHOUTER ----
+                    # ---- Configure ChipSHOUTER (no disarm needed) ----
                     try:
                         self.cs.voltage = v
                         self.cs.pulse.width = pw
                         if delay_us > 0:
-                            self.cs.trigger.offset = delay_us
+                            if hasattr(self.cs, "trigger") and hasattr(self.cs.trigger, "offset"):
+                                self.cs.trigger.offset = delay_us
+                            else:
+                                if not self._warned_no_trigger_offset:
+                                    self._warned_no_trigger_offset = True
+                                    self.log_signal.emit(
+                                        "Trigger offset not supported by this ChipSHOUTER library. "
+                                        "Delay sweep is ignored.")
                         time.sleep(0.05)
                     except Reset_Exception:
                         self.log_signal.emit(f"ChipSHOUTER reset at V={v} PW={pw}")
-                        self._safe_disarm()
+                        armed_ok = False
                         continue
                     except Exception as e:
                         self.log_signal.emit(f"Config error V={v} PW={pw}: {e}")
                         continue
 
-                    # ---- ARM ----
-                    try:
-                        self.cs.armed = 1
-                        time.sleep(0.2)
-                    except Reset_Exception:
-                        self.log_signal.emit(f"ChipSHOUTER reset on ARM V={v} PW={pw}")
-                        continue
-                    except Exception as e:
-                        self.log_signal.emit(f"Arm error V={v} PW={pw}: {e}")
-                        continue
+                    # ---- Re-arm only if needed (after reset) ----
+                    if not armed_ok:
+                        try:
+                            self.cs.armed = 1
+                            time.sleep(0.3)
+                            armed_ok = True
+                            self.log_signal.emit(f"Re-armed at V={v} PW={pw}")
+                        except Reset_Exception:
+                            self.log_signal.emit(f"ChipSHOUTER reset on re-arm V={v} PW={pw}")
+                            continue
+                        except Exception as e:
+                            self.log_signal.emit(f"Re-arm error V={v} PW={pw}: {e}")
+                            continue
 
                     glitch = 0
                     error = 0
@@ -524,11 +548,13 @@ class SweepWorker(QObject):
                             if new_bl:
                                 baseline_ct = new_bl
                                 self.log_signal.emit(f"New baseline CT after reset: {baseline_ct}")
-                            # Re-arm for remaining pulses
+                            # Re-arm after KW45 reset
                             try:
                                 self.cs.armed = 1
-                                time.sleep(0.2)
+                                time.sleep(0.3)
+                                armed_ok = True
                             except Exception:
+                                armed_ok = False
                                 break
                             continue
 
@@ -539,8 +565,7 @@ class SweepWorker(QObject):
                         else:
                             normal += 1
 
-                    # ---- DISARM after each test point ----
-                    self._safe_disarm()
+                    # (stay armed between test points – no per-point disarm)
 
                     n_total = glitch + error + normal + reset
                     result = {
@@ -645,12 +670,16 @@ class SweepWorker(QObject):
             return None
 
     def _safe_disarm(self):
-        """Disarm ChipSHOUTER, ignoring errors."""
-        try:
-            if self.cs:
-                self.cs.armed = 0
-        except Exception:
-            pass
+        """Disarm ChipSHOUTER, with retry."""
+        for _ in range(3):
+            try:
+                if self.cs:
+                    self.cs.armed = 0
+                    time.sleep(0.15)
+                    return
+            except Exception:
+                time.sleep(0.1)
+        # last resort – ignore
 
     def stop_sweep(self):
         self._stop_requested = True
