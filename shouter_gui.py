@@ -5,7 +5,7 @@ import serial
 import serial.tools.list_ports
 from PySide6.QtWidgets import (QApplication, QMainWindow, QPushButton, QVBoxLayout, 
                              QHBoxLayout, QWidget, QSlider, QLabel, QTextEdit, QComboBox,
-                             QSpinBox, QGroupBox, QGridLayout, QLineEdit,
+                             QSpinBox, QGroupBox, QGridLayout, QLineEdit, QCheckBox,
                              QSplitter, QFrame, QDockWidget, QFileDialog, QProgressBar)
 from PySide6.QtCore import QThread, Signal, QObject, Qt, QTimer
 from PySide6.QtGui import QFont, QTextCursor
@@ -426,51 +426,54 @@ class SweepWorker(QObject):
 
         ser = target_serial
 
-        # ---- Build sweep grid ----
-        voltages = list(range(config['v_start'], config['v_end'] + 1, max(1, config['v_step'])))
-        pulse_widths = list(range(config['pw_start'], config['pw_end'] + 1, max(1, config['pw_step'])))
-        delays = list(range(config.get('delay_start', 0),
-                            config.get('delay_end', 0) + 1,
-                            max(1, config.get('delay_step', 1))))
-        if not delays:
-            delays = [0]
+        # ---- Build sweep grid (respect sweep_axes) ----
+        axes = config.get('sweep_axes', {'voltage', 'pulse_width', 'delay'})
+        if 'voltage' in axes:
+            voltages = list(range(config['v_start'], config['v_end'] + 1, max(1, config['v_step'])))
+        else:
+            voltages = [config['v_start']]  # fixed at start value
+        if 'pulse_width' in axes:
+            pulse_widths = list(range(config['pw_start'], config['pw_end'] + 1, max(1, config['pw_step'])))
+        else:
+            pulse_widths = [config['pw_start']]  # fixed at start value
+        if 'delay' in axes:
+            delays = list(range(config.get('delay_start', 0),
+                                config.get('delay_end', 0) + 1,
+                                max(1, config.get('delay_step', 1))))
+            if not delays:
+                delays = [0]
+        else:
+            delays = [config.get('delay_start', 0)]  # fixed at start value
 
         total = len(voltages) * len(pulse_widths) * len(delays)
         n_pulses = config.get('pulses_per_point', 5)
+        pulse_interval = config.get('pulse_interval', 2)
         mode = config.get('mode', '1')
 
         self.log_signal.emit(
             f"Sweep grid: {len(voltages)}V x {len(pulse_widths)}PW x {len(delays)}Delay "
             f"= {total} points, {n_pulses} pulses/point")
 
-        # ---- Fixed params ----
+        # ---- Fixed params (set while disarmed) ----
         try:
             self.cs.pulse.repeat = config.get('pulse_repeat', 1)
             self.cs.pulse.deadtime = config.get('deadtime', 10)
             self.cs.mute = 1
-            # Configure external hardware trigger (KW45 drives trigger line)
-            self.cs.hwtrig_mode = True   # Active-High
-            self.cs.hwtrig_term = False  # High impedance
-            self.log_signal.emit("HW trigger: external, active-high, hi-Z termination")
         except Exception as e:
             self.log_signal.emit(f"Fixed param config error: {e}")
+
+        # ---- Initial clear faults ----
+        try:
+            self.cs.faults_current = 0
+            time.sleep(0.1)
+            self.log_signal.emit("Faults cleared")
+        except Exception:
+            pass
 
         # ---- Set KW45 mode & get baseline CT ----
         baseline_ct = self._setup_target_mode(ser, mode)
         if baseline_ct is None and not self._stop_requested:
             self.log_signal.emit("WARNING: Could not obtain baseline CT. Glitch detection may be inaccurate.")
-
-        # ---- ARM once before sweep loop ----
-        armed_ok = False
-        try:
-            self.cs.armed = 1
-            time.sleep(0.3)
-            armed_ok = True
-            self.log_signal.emit("Device armed – starting sweep loop")
-        except Reset_Exception:
-            self.log_signal.emit("ChipSHOUTER reset on initial ARM")
-        except Exception as e:
-            self.log_signal.emit(f"Initial arm error: {e}")
 
         step = 0
         for v in voltages:
@@ -484,7 +487,10 @@ class SweepWorker(QObject):
                         break
                     step += 1
 
-                    # ---- Configure ChipSHOUTER (no disarm needed) ----
+                    # ---- 1) Disarm before changing parameters ----
+                    self._safe_disarm()
+
+                    # ---- 2) Set parameters (while disarmed) ----
                     try:
                         self.cs.voltage = v
                         self.cs.pulse.width = pw
@@ -500,26 +506,20 @@ class SweepWorker(QObject):
                         time.sleep(0.05)
                     except Reset_Exception:
                         self.log_signal.emit(f"ChipSHOUTER reset at V={v} PW={pw}")
-                        armed_ok = False
                         continue
                     except Exception as e:
                         self.log_signal.emit(f"Config error V={v} PW={pw}: {e}")
                         continue
 
-                    # ---- Re-arm only if needed (after reset) ----
-                    if not armed_ok:
-                        try:
-                            self.cs.armed = 1
-                            time.sleep(0.3)
-                            armed_ok = True
-                            self.log_signal.emit(f"Re-armed at V={v} PW={pw}")
-                        except Reset_Exception:
-                            self.log_signal.emit(f"ChipSHOUTER reset on re-arm V={v} PW={pw}")
-                            continue
-                        except Exception as e:
-                            self.log_signal.emit(f"Re-arm error V={v} PW={pw}: {e}")
-                            continue
+                    # ---- 3) Clear faults & Arm ----
+                    if not self._try_clear_and_arm():
+                        self.log_signal.emit(f"Arm failed V={v} PW={pw}, skipping")
+                        continue
 
+                    # Wait for capacitor charge after arm
+                    time.sleep(1.0)
+
+                    # ---- 4) Pulse loop ----
                     glitch = 0
                     error = 0
                     normal = 0
@@ -530,7 +530,10 @@ class SweepWorker(QObject):
                         if self._stop_requested:
                             break
 
-                        # Send START -> KW45 encrypts + generates trigger -> ChipSHOUTER fires
+                        # Wait between pulses (skip before first pulse)
+                        if pulse_idx > 0 and pulse_interval > 0:
+                            time.sleep(pulse_interval)
+
                         resp = self._target_exchange(ser)
 
                         if resp is None:
@@ -538,7 +541,6 @@ class SweepWorker(QObject):
                             continue
 
                         if resp.get('_reset'):
-                            # KW45 reset detected
                             reset += 1
                             self.reset_count += 1
                             self.log_signal.emit(
@@ -548,13 +550,8 @@ class SweepWorker(QObject):
                             if new_bl:
                                 baseline_ct = new_bl
                                 self.log_signal.emit(f"New baseline CT after reset: {baseline_ct}")
-                            # Re-arm after KW45 reset
-                            try:
-                                self.cs.armed = 1
-                                time.sleep(0.3)
-                                armed_ok = True
-                            except Exception:
-                                armed_ok = False
+                            # Clear faults & re-arm for remaining pulses
+                            if not self._try_clear_and_arm():
                                 break
                             continue
 
@@ -564,8 +561,6 @@ class SweepWorker(QObject):
                             glitch += 1
                         else:
                             normal += 1
-
-                    # (stay armed between test points – no per-point disarm)
 
                     n_total = glitch + error + normal + reset
                     result = {
@@ -684,9 +679,57 @@ class SweepWorker(QObject):
     def stop_sweep(self):
         self._stop_requested = True
 
+    def _try_clear_and_arm(self):
+        """Clear faults then arm. fault_trigger_glitch is expected in ext-trigger mode."""
+        for attempt in range(3):
+            try:
+                self.cs.faults_current = 0
+                time.sleep(0.1)
+                self.cs.armed = 1
+                time.sleep(0.2)
+                return True
+            except Reset_Exception:
+                self.log_signal.emit("ChipSHOUTER reset during arm")
+                return False
+            except Exception as e:
+                if attempt < 2:
+                    self.log_signal.emit(f"Arm attempt {attempt+1} failed: {e}, retrying...")
+                    time.sleep(0.3)
+                else:
+                    self.log_signal.emit(f"Arm failed after 3 attempts: {e}")
+        return False
+
 
 # --- 主界面 (Ventana Principal) ---
 class MainWindow(QMainWindow):
+    # Probe tip pulse-width limits: list of (voltage, pw_min, pw_max)
+    PROBE_LIMITS = {
+        '4mm': {
+            'v_min': 125, 'v_max': 400,
+            'table': [
+                (125, 38, 500),
+                (150, 35, 400),
+                (200, 30, 270),
+                (250, 27, 200),
+                (300, 24, 160),
+                (325, 28, 140),
+                (350, 26, 130),
+                (400, 25, 105),
+            ],
+        },
+        '1mm': {
+            'v_min': 110, 'v_max': 300,
+            'table': [
+                (110, 33, 82),
+                (150, 26, 55),
+                (200, 21, 38),
+                (250, 18, 28),
+                (290, 16, 22),
+                (300, 16, 20),
+            ],
+        },
+    }
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle("ChipSHOUTER GUI Control")
@@ -878,38 +921,49 @@ class MainWindow(QMainWindow):
         config_group = QGroupBox("Device Configuration")
         config_grid = QGridLayout(config_group)
 
-        # Voltage
-        config_grid.addWidget(QLabel("Voltage (V):"), 0, 0)
+        # Probe Tip selector (row 0)
+        config_grid.addWidget(QLabel("Probe Tip:"), 0, 0)
+        self.probe_tip_box = QComboBox()
+        self.probe_tip_box.addItems(["4mm", "1mm"])
+        self.probe_tip_box.setCurrentText("4mm")
+        self.probe_tip_box.setStyleSheet("font-weight: bold;")
+        config_grid.addWidget(self.probe_tip_box, 0, 1)
+        self.pw_limits_label = QLabel("")
+        self.pw_limits_label.setStyleSheet("color: #ffab40; font-size: 11px;")
+        config_grid.addWidget(self.pw_limits_label, 0, 2, 1, 2)
+
+        # Voltage (row 1)
+        config_grid.addWidget(QLabel("Voltage (V):"), 1, 0)
         self.voltage_slider = QSlider(Qt.Horizontal)
-        self.voltage_slider.setRange(150, 500)
+        self.voltage_slider.setRange(125, 400)
         self.voltage_slider.setValue(300)
         self.voltage_edit = QLineEdit("300")
         self.voltage_edit.setFixedWidth(80)
         self.voltage_edit.setAlignment(Qt.AlignCenter)
         self.voltage_slider.valueChanged.connect(lambda v: self.voltage_edit.setText(str(v)))
         self.voltage_edit.editingFinished.connect(lambda: self._sync_edit_to_slider(self.voltage_edit, self.voltage_slider))
-        config_grid.addWidget(self.voltage_slider, 0, 1)
-        config_grid.addWidget(self.voltage_edit, 0, 2)
+        config_grid.addWidget(self.voltage_slider, 1, 1)
+        config_grid.addWidget(self.voltage_edit, 1, 2)
         self.btn_set_voltage = QPushButton("Set")
-        config_grid.addWidget(self.btn_set_voltage, 0, 3)
+        config_grid.addWidget(self.btn_set_voltage, 1, 3)
 
-        # Pulse Width
-        config_grid.addWidget(QLabel("Pulse Width (ns):"), 1, 0)
+        # Pulse Width (row 2)
+        config_grid.addWidget(QLabel("Pulse Width (ns):"), 2, 0)
         self.pulse_width_slider = QSlider(Qt.Horizontal)
-        self.pulse_width_slider.setRange(80, 960)
+        self.pulse_width_slider.setRange(24, 160)
         self.pulse_width_slider.setValue(160)
         self.pulse_width_edit = QLineEdit("160")
         self.pulse_width_edit.setFixedWidth(80)
         self.pulse_width_edit.setAlignment(Qt.AlignCenter)
         self.pulse_width_slider.valueChanged.connect(lambda v: self.pulse_width_edit.setText(str(v)))
         self.pulse_width_edit.editingFinished.connect(lambda: self._sync_edit_to_slider(self.pulse_width_edit, self.pulse_width_slider))
-        config_grid.addWidget(self.pulse_width_slider, 1, 1)
-        config_grid.addWidget(self.pulse_width_edit, 1, 2)
+        config_grid.addWidget(self.pulse_width_slider, 2, 1)
+        config_grid.addWidget(self.pulse_width_edit, 2, 2)
         self.btn_set_width = QPushButton("Set")
-        config_grid.addWidget(self.btn_set_width, 1, 3)
+        config_grid.addWidget(self.btn_set_width, 2, 3)
 
-        # Pulse Repeat
-        config_grid.addWidget(QLabel("Pulse Repeat:"), 2, 0)
+        # Pulse Repeat (row 3)
+        config_grid.addWidget(QLabel("Pulse Repeat:"), 3, 0)
         self.pulse_repeat_slider = QSlider(Qt.Horizontal)
         self.pulse_repeat_slider.setRange(1, 10000)
         self.pulse_repeat_slider.setValue(1)
@@ -918,13 +972,13 @@ class MainWindow(QMainWindow):
         self.pulse_repeat_edit.setAlignment(Qt.AlignCenter)
         self.pulse_repeat_slider.valueChanged.connect(lambda v: self.pulse_repeat_edit.setText(str(v)))
         self.pulse_repeat_edit.editingFinished.connect(lambda: self._sync_edit_to_slider(self.pulse_repeat_edit, self.pulse_repeat_slider))
-        config_grid.addWidget(self.pulse_repeat_slider, 2, 1)
-        config_grid.addWidget(self.pulse_repeat_edit, 2, 2)
+        config_grid.addWidget(self.pulse_repeat_slider, 3, 1)
+        config_grid.addWidget(self.pulse_repeat_edit, 3, 2)
         self.btn_set_repeat = QPushButton("Set")
-        config_grid.addWidget(self.btn_set_repeat, 2, 3)
+        config_grid.addWidget(self.btn_set_repeat, 3, 3)
 
-        # Deadtime
-        config_grid.addWidget(QLabel("Deadtime (ms):"), 3, 0)
+        # Deadtime (row 4)
+        config_grid.addWidget(QLabel("Deadtime (ms):"), 4, 0)
         self.deadtime_slider = QSlider(Qt.Horizontal)
         self.deadtime_slider.setRange(1, 1000)
         self.deadtime_slider.setValue(10)
@@ -933,36 +987,36 @@ class MainWindow(QMainWindow):
         self.deadtime_edit.setAlignment(Qt.AlignCenter)
         self.deadtime_slider.valueChanged.connect(lambda v: self.deadtime_edit.setText(str(v)))
         self.deadtime_edit.editingFinished.connect(lambda: self._sync_edit_to_slider(self.deadtime_edit, self.deadtime_slider))
-        config_grid.addWidget(self.deadtime_slider, 3, 1)
-        config_grid.addWidget(self.deadtime_edit, 3, 2)
+        config_grid.addWidget(self.deadtime_slider, 4, 1)
+        config_grid.addWidget(self.deadtime_edit, 4, 2)
         self.btn_set_deadtime = QPushButton("Set")
-        config_grid.addWidget(self.btn_set_deadtime, 3, 3)
+        config_grid.addWidget(self.btn_set_deadtime, 4, 3)
 
-        # HW Trigger Mode
-        config_grid.addWidget(QLabel("HW Trigger Mode:"), 4, 0)
+        # HW Trigger Mode (row 5)
+        config_grid.addWidget(QLabel("HW Trigger Mode:"), 5, 0)
         self.hwtrig_mode_box = QComboBox()
         self.hwtrig_mode_box.addItems(["Active-High", "Active-Low"])
-        config_grid.addWidget(self.hwtrig_mode_box, 4, 1)
+        config_grid.addWidget(self.hwtrig_mode_box, 5, 1)
         self.btn_set_hwtrig_mode = QPushButton("Set")
-        config_grid.addWidget(self.btn_set_hwtrig_mode, 4, 2)
+        config_grid.addWidget(self.btn_set_hwtrig_mode, 5, 2)
 
-        # HW Trigger Termination
-        config_grid.addWidget(QLabel("HW Trigger Term:"), 5, 0)
+        # HW Trigger Termination (row 6)
+        config_grid.addWidget(QLabel("HW Trigger Term:"), 6, 0)
         self.hwtrig_term_box = QComboBox()
         self.hwtrig_term_box.addItems(["High Impedance (~1.8K)","50-ohm"])
-        config_grid.addWidget(self.hwtrig_term_box, 5, 1)
+        config_grid.addWidget(self.hwtrig_term_box, 6, 1)
         self.btn_set_hwtrig_term = QPushButton("Set")
-        config_grid.addWidget(self.btn_set_hwtrig_term, 5, 2)
+        config_grid.addWidget(self.btn_set_hwtrig_term, 6, 2)
 
-        # Reset
+        # Reset (row 7)
         self.btn_reset_device = QPushButton("Reset Device")
         self.btn_reset_device.setStyleSheet("background-color: #b71c1c; color: white;")
-        config_grid.addWidget(self.btn_reset_device, 6, 0, 1, 3)
+        config_grid.addWidget(self.btn_reset_device, 7, 0, 1, 3)
 
-        # Apply All button
+        # Apply All button (row 8)
         self.btn_apply_all = QPushButton("Apply All Settings")
         self.btn_apply_all.setStyleSheet("background-color: #01579b; color: white;")
-        config_grid.addWidget(self.btn_apply_all, 7, 0, 1, 3)
+        config_grid.addWidget(self.btn_apply_all, 8, 0, 1, 3)
 
         basic_layout.addWidget(config_group)
 
@@ -1123,8 +1177,27 @@ class MainWindow(QMainWindow):
         sweep_info.setStyleSheet("color: #ffab40; font-weight: bold; padding: 4px;")
         sweep_layout.addWidget(sweep_info)
 
+        # Sweep axis checkboxes
+        combo_group = QGroupBox("Sweep Axes")
+        combo_layout = QHBoxLayout(combo_group)
+        self.chk_sweep_voltage = QCheckBox("Voltage")
+        self.chk_sweep_voltage.setChecked(True)
+        self.chk_sweep_voltage.setStyleSheet("font-weight: bold; color: #4fc3f7;")
+        self.chk_sweep_pw = QCheckBox("Pulse Width")
+        self.chk_sweep_pw.setChecked(True)
+        self.chk_sweep_pw.setStyleSheet("font-weight: bold; color: #81c784;")
+        self.chk_sweep_delay = QCheckBox("Delay")
+        self.chk_sweep_delay.setChecked(False)
+        self.chk_sweep_delay.setStyleSheet("font-weight: bold; color: #ffb74d;")
+        combo_layout.addWidget(self.chk_sweep_voltage)
+        combo_layout.addWidget(self.chk_sweep_pw)
+        combo_layout.addWidget(self.chk_sweep_delay)
+        combo_layout.addStretch()
+        sweep_layout.addWidget(combo_group)
+
         # Sweep voltage range
-        sv_group = QGroupBox("Voltage Sweep (V)")
+        self.sv_group = QGroupBox("Voltage Sweep (V)")
+        sv_group = self.sv_group
         sv_grid = QGridLayout(sv_group)
         sv_grid.addWidget(QLabel("Start:"), 0, 0)
         self.sweep_v_start = QSpinBox()
@@ -1147,7 +1220,8 @@ class MainWindow(QMainWindow):
         sweep_layout.addWidget(sv_group)
 
         # Sweep pulse width range
-        sp_group = QGroupBox("Pulse Width Sweep (ns)")
+        self.sp_group = QGroupBox("Pulse Width Sweep (ns)")
+        sp_group = self.sp_group
         sp_grid = QGridLayout(sp_group)
         sp_grid.addWidget(QLabel("Start:"), 0, 0)
         self.sweep_pw_start = QSpinBox()
@@ -1170,7 +1244,8 @@ class MainWindow(QMainWindow):
         sweep_layout.addWidget(sp_group)
 
         # Trigger delay sweep range
-        sd_group = QGroupBox("Trigger Delay Sweep (µs)")
+        self.sd_group = QGroupBox("Trigger Delay Sweep (µs)")
+        sd_group = self.sd_group
         sd_grid = QGridLayout(sd_group)
         sd_grid.addWidget(QLabel("Start:"), 0, 0)
         self.sweep_delay_start = QSpinBox()
@@ -1205,6 +1280,13 @@ class MainWindow(QMainWindow):
         self.sweep_repeat.setRange(1, 10000)
         self.sweep_repeat.setValue(1)
         st_grid.addWidget(self.sweep_repeat, 0, 3)
+        st_grid.addWidget(QLabel("Pulse Interval (s):"), 0, 4)
+        self.sweep_pulse_interval = QSpinBox()
+        self.sweep_pulse_interval.setRange(0, 60)
+        self.sweep_pulse_interval.setValue(2)
+        self.sweep_pulse_interval.setSuffix(" s")
+        self.sweep_pulse_interval.setToolTip("Delay between each pulse within a test point (seconds)")
+        st_grid.addWidget(self.sweep_pulse_interval, 0, 5)
         st_grid.addWidget(QLabel("Deadtime (ms):"), 1, 0)
         self.sweep_deadtime = QSpinBox()
         self.sweep_deadtime.setRange(1, 1000)
@@ -1329,6 +1411,11 @@ class MainWindow(QMainWindow):
         self.btn_set_hwtrig_term.clicked.connect(lambda: self.worker.request_set_hwtrig_term.emit(self.hwtrig_term_box.currentIndex() == 0))
         self.btn_reset_device.clicked.connect(self.worker.request_reset.emit)
 
+        # Probe tip & voltage -> PW limits
+        self.probe_tip_box.currentTextChanged.connect(self._on_probe_changed)
+        self.voltage_slider.valueChanged.connect(self._on_voltage_changed_update_pw_limits)
+        self._on_probe_changed()  # Apply initial limits
+
         # Basic mode - Actions
         self.btn_arm.clicked.connect(self.arm_device)
         self.btn_disarm.clicked.connect(self.disarm_device)
@@ -1362,6 +1449,10 @@ class MainWindow(QMainWindow):
         # Sweep controls
         self.btn_sweep_start.clicked.connect(self.start_sweep)
         self.btn_sweep_stop.clicked.connect(self.stop_sweep)
+        self.chk_sweep_voltage.toggled.connect(self._update_sweep_group_visibility)
+        self.chk_sweep_pw.toggled.connect(self._update_sweep_group_visibility)
+        self.chk_sweep_delay.toggled.connect(self._update_sweep_group_visibility)
+        self._update_sweep_group_visibility()  # Apply initial state
         self.btn_sweep_export.clicked.connect(self.export_sweep_csv)
         self.btn_sweep_clear.clicked.connect(self.sweep_results_log.clear)
         self.sweep_worker.progress_signal.connect(self.on_sweep_progress)
@@ -1785,6 +1876,99 @@ class MainWindow(QMainWindow):
         self.append_log("!!! RESET DETECTADO !!! Re-iniciando en 5s...")
         self.append_fault_log("[INFO] !!! HARDWARE RESET DETECTED !!!")
 
+    def _get_pw_limits_for_voltage(self, voltage, probe=None):
+        """Linearly interpolate PW min/max for a given voltage from the probe table."""
+        if probe is None:
+            probe = self.probe_tip_box.currentText()
+        info = self.PROBE_LIMITS.get(probe, self.PROBE_LIMITS['4mm'])
+        table = info['table']
+        # Clamp voltage to table range
+        v = max(table[0][0], min(table[-1][0], voltage))
+        # Find bracketing entries
+        for i in range(len(table) - 1):
+            v0, pw_min0, pw_max0 = table[i]
+            v1, pw_min1, pw_max1 = table[i + 1]
+            if v0 <= v <= v1:
+                if v1 == v0:
+                    return pw_min0, pw_max0
+                t = (v - v0) / (v1 - v0)
+                pw_min = int(round(pw_min0 + t * (pw_min1 - pw_min0)))
+                pw_max = int(round(pw_max0 + t * (pw_max1 - pw_max0)))
+                return pw_min, pw_max
+        # Fallback: last entry
+        return table[-1][1], table[-1][2]
+
+    def _on_probe_changed(self):
+        """Update voltage range and PW limits when probe tip changes."""
+        probe = self.probe_tip_box.currentText()
+        info = self.PROBE_LIMITS.get(probe, self.PROBE_LIMITS['4mm'])
+        v_min, v_max = info['v_min'], info['v_max']
+
+        # Update voltage slider range
+        self.voltage_slider.setRange(v_min, v_max)
+        # Clamp current value
+        cur_v = self.voltage_slider.value()
+        if cur_v < v_min:
+            self.voltage_slider.setValue(v_min)
+        elif cur_v > v_max:
+            self.voltage_slider.setValue(v_max)
+
+        # Update sweep voltage spinboxes
+        self.sweep_v_start.setRange(v_min, v_max)
+        self.sweep_v_end.setRange(v_min, v_max)
+        if self.sweep_v_start.value() < v_min:
+            self.sweep_v_start.setValue(v_min)
+        if self.sweep_v_end.value() > v_max:
+            self.sweep_v_end.setValue(v_max)
+
+        # Update PW limits for current voltage
+        self._on_voltage_changed_update_pw_limits(self.voltage_slider.value())
+
+    def _on_voltage_changed_update_pw_limits(self, voltage=None):
+        """Update pulse width slider range based on current voltage and probe."""
+        if voltage is None:
+            voltage = self.voltage_slider.value()
+        pw_min, pw_max = self._get_pw_limits_for_voltage(voltage)
+
+        # Update basic mode PW slider
+        self.pulse_width_slider.setRange(pw_min, pw_max)
+        cur_pw = self.pulse_width_slider.value()
+        if cur_pw < pw_min:
+            self.pulse_width_slider.setValue(pw_min)
+        elif cur_pw > pw_max:
+            self.pulse_width_slider.setValue(pw_max)
+        self.pulse_width_edit.setText(str(self.pulse_width_slider.value()))
+
+        # Update sweep PW spinboxes range (use global min/max across all voltages for this probe)
+        probe = self.probe_tip_box.currentText()
+        info = self.PROBE_LIMITS.get(probe, self.PROBE_LIMITS['4mm'])
+        global_pw_min = min(row[1] for row in info['table'])
+        global_pw_max = max(row[2] for row in info['table'])
+        self.sweep_pw_start.setRange(global_pw_min, global_pw_max)
+        self.sweep_pw_end.setRange(global_pw_min, global_pw_max)
+        if self.sweep_pw_end.value() > global_pw_max:
+            self.sweep_pw_end.setValue(global_pw_max)
+
+        # Show current limits on label
+        self.pw_limits_label.setText(f"PW: {pw_min}–{pw_max} ns @ {voltage}V")
+
+    def _update_sweep_group_visibility(self):
+        """Enable/disable parameter groups based on checkbox state."""
+        self.sv_group.setEnabled(self.chk_sweep_voltage.isChecked())
+        self.sp_group.setEnabled(self.chk_sweep_pw.isChecked())
+        self.sd_group.setEnabled(self.chk_sweep_delay.isChecked())
+
+    def _get_sweep_axes(self):
+        """Return set of active sweep axes based on checkboxes."""
+        axes = set()
+        if self.chk_sweep_voltage.isChecked():
+            axes.add('voltage')
+        if self.chk_sweep_pw.isChecked():
+            axes.add('pulse_width')
+        if self.chk_sweep_delay.isChecked():
+            axes.add('delay')
+        return axes
+
     # ========== SWEEP METHODS ==========
     def start_sweep(self):
         if not self.api_connected:
@@ -1824,14 +2008,17 @@ class MainWindow(QMainWindow):
             'pulses_per_point': self.sweep_pulses.value(),
             'pulse_repeat': self.sweep_repeat.value(),
             'deadtime': self.sweep_deadtime.value(),
+            'pulse_interval': self.sweep_pulse_interval.value(),
             'mode': self.sweep_mode_box.currentText(),
+            'sweep_axes': self._get_sweep_axes(),
         }
 
-        # Calculate total points for progress bar
-        v_count = len(range(config['v_start'], config['v_end'] + 1, max(1, config['v_step'])))
-        pw_count = len(range(config['pw_start'], config['pw_end'] + 1, max(1, config['pw_step'])))
+        # Calculate total points for progress bar (respect sweep_axes)
+        axes = config.get('sweep_axes', {'voltage', 'pulse_width', 'delay'})
+        v_count = len(range(config['v_start'], config['v_end'] + 1, max(1, config['v_step']))) if 'voltage' in axes else 1
+        pw_count = len(range(config['pw_start'], config['pw_end'] + 1, max(1, config['pw_step']))) if 'pulse_width' in axes else 1
         delays = list(range(config['delay_start'], config['delay_end'] + 1, max(1, config['delay_step'])))
-        d_count = max(1, len(delays))
+        d_count = max(1, len(delays)) if 'delay' in axes else 1
         self.sweep_progress.setMaximum(v_count * pw_count * d_count)
 
         self.append_log(

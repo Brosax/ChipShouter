@@ -1,0 +1,4 @@
+﻿voltage_V,pulse_width_ns,delay_us,glitches,resets,errors,normal,total,glitch_rate,baseline_ct,last_ct
+150,80,0,0,0,0,10,10,0.0%,f09528b51ee3416e50b4454dc3daa1db,f09528b51ee3416e50b4454dc3daa1db
+200,80,0,3,0,2,5,10,30.0%,f09528b51ee3416e50b4454dc3daa1db,0b0dbbb56ee5dd5621e8fa5be679d13d
+250,80,0,0,10,0,0,10,0.0%,866675aae53e67e9546be22803ad5ef9,
