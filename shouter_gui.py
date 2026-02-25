@@ -1200,23 +1200,33 @@ class MainWindow(QMainWindow):
         sv_group = self.sv_group
         sv_grid = QGridLayout(sv_group)
         sv_grid.addWidget(QLabel("Start:"), 0, 0)
-        self.sweep_v_start = QSpinBox()
-        self.sweep_v_start.setRange(150, 500)
-        self.sweep_v_start.setValue(200)
-        self.sweep_v_start.setSuffix(" V")
-        sv_grid.addWidget(self.sweep_v_start, 0, 1)
-        sv_grid.addWidget(QLabel("End:"), 0, 2)
-        self.sweep_v_end = QSpinBox()
-        self.sweep_v_end.setRange(150, 500)
-        self.sweep_v_end.setValue(500)
-        self.sweep_v_end.setSuffix(" V")
-        sv_grid.addWidget(self.sweep_v_end, 0, 3)
-        sv_grid.addWidget(QLabel("Step:"), 0, 4)
+        self.sweep_v_start_slider = QSlider(Qt.Horizontal)
+        self.sweep_v_start_slider.setRange(125, 400)
+        self.sweep_v_start_slider.setValue(200)
+        self.sweep_v_start_edit = QLineEdit("200")
+        self.sweep_v_start_edit.setFixedWidth(60)
+        self.sweep_v_start_edit.setAlignment(Qt.AlignCenter)
+        self.sweep_v_start_slider.valueChanged.connect(lambda v: self.sweep_v_start_edit.setText(str(v)))
+        self.sweep_v_start_edit.editingFinished.connect(lambda: self._sync_edit_to_slider(self.sweep_v_start_edit, self.sweep_v_start_slider))
+        sv_grid.addWidget(self.sweep_v_start_slider, 0, 1)
+        sv_grid.addWidget(self.sweep_v_start_edit, 0, 2)
+        sv_grid.addWidget(QLabel("End:"), 1, 0)
+        self.sweep_v_end_slider = QSlider(Qt.Horizontal)
+        self.sweep_v_end_slider.setRange(125, 400)
+        self.sweep_v_end_slider.setValue(400)
+        self.sweep_v_end_edit = QLineEdit("400")
+        self.sweep_v_end_edit.setFixedWidth(60)
+        self.sweep_v_end_edit.setAlignment(Qt.AlignCenter)
+        self.sweep_v_end_slider.valueChanged.connect(lambda v: self.sweep_v_end_edit.setText(str(v)))
+        self.sweep_v_end_edit.editingFinished.connect(lambda: self._sync_edit_to_slider(self.sweep_v_end_edit, self.sweep_v_end_slider))
+        sv_grid.addWidget(self.sweep_v_end_slider, 1, 1)
+        sv_grid.addWidget(self.sweep_v_end_edit, 1, 2)
+        sv_grid.addWidget(QLabel("Step:"), 2, 0)
         self.sweep_v_step = QSpinBox()
         self.sweep_v_step.setRange(1, 350)
         self.sweep_v_step.setValue(50)
         self.sweep_v_step.setSuffix(" V")
-        sv_grid.addWidget(self.sweep_v_step, 0, 5)
+        sv_grid.addWidget(self.sweep_v_step, 2, 1)
         sweep_layout.addWidget(sv_group)
 
         # Sweep pulse width range
@@ -1224,23 +1234,33 @@ class MainWindow(QMainWindow):
         sp_group = self.sp_group
         sp_grid = QGridLayout(sp_group)
         sp_grid.addWidget(QLabel("Start:"), 0, 0)
-        self.sweep_pw_start = QSpinBox()
-        self.sweep_pw_start.setRange(80, 960)
-        self.sweep_pw_start.setValue(80)
-        self.sweep_pw_start.setSuffix(" ns")
-        sp_grid.addWidget(self.sweep_pw_start, 0, 1)
-        sp_grid.addWidget(QLabel("End:"), 0, 2)
-        self.sweep_pw_end = QSpinBox()
-        self.sweep_pw_end.setRange(80, 960)
-        self.sweep_pw_end.setValue(480)
-        self.sweep_pw_end.setSuffix(" ns")
-        sp_grid.addWidget(self.sweep_pw_end, 0, 3)
-        sp_grid.addWidget(QLabel("Step:"), 0, 4)
+        self.sweep_pw_start_slider = QSlider(Qt.Horizontal)
+        self.sweep_pw_start_slider.setRange(16, 500)
+        self.sweep_pw_start_slider.setValue(80)
+        self.sweep_pw_start_edit = QLineEdit("80")
+        self.sweep_pw_start_edit.setFixedWidth(60)
+        self.sweep_pw_start_edit.setAlignment(Qt.AlignCenter)
+        self.sweep_pw_start_slider.valueChanged.connect(lambda v: self.sweep_pw_start_edit.setText(str(v)))
+        self.sweep_pw_start_edit.editingFinished.connect(lambda: self._sync_edit_to_slider(self.sweep_pw_start_edit, self.sweep_pw_start_slider))
+        sp_grid.addWidget(self.sweep_pw_start_slider, 0, 1)
+        sp_grid.addWidget(self.sweep_pw_start_edit, 0, 2)
+        sp_grid.addWidget(QLabel("End:"), 1, 0)
+        self.sweep_pw_end_slider = QSlider(Qt.Horizontal)
+        self.sweep_pw_end_slider.setRange(16, 500)
+        self.sweep_pw_end_slider.setValue(480)
+        self.sweep_pw_end_edit = QLineEdit("480")
+        self.sweep_pw_end_edit.setFixedWidth(60)
+        self.sweep_pw_end_edit.setAlignment(Qt.AlignCenter)
+        self.sweep_pw_end_slider.valueChanged.connect(lambda v: self.sweep_pw_end_edit.setText(str(v)))
+        self.sweep_pw_end_edit.editingFinished.connect(lambda: self._sync_edit_to_slider(self.sweep_pw_end_edit, self.sweep_pw_end_slider))
+        sp_grid.addWidget(self.sweep_pw_end_slider, 1, 1)
+        sp_grid.addWidget(self.sweep_pw_end_edit, 1, 2)
+        sp_grid.addWidget(QLabel("Step:"), 2, 0)
         self.sweep_pw_step = QSpinBox()
         self.sweep_pw_step.setRange(1, 880)
         self.sweep_pw_step.setValue(40)
         self.sweep_pw_step.setSuffix(" ns")
-        sp_grid.addWidget(self.sweep_pw_step, 0, 5)
+        sp_grid.addWidget(self.sweep_pw_step, 2, 1)
         sweep_layout.addWidget(sp_group)
 
         # Trigger delay sweep range
@@ -1913,13 +1933,13 @@ class MainWindow(QMainWindow):
         elif cur_v > v_max:
             self.voltage_slider.setValue(v_max)
 
-        # Update sweep voltage spinboxes
-        self.sweep_v_start.setRange(v_min, v_max)
-        self.sweep_v_end.setRange(v_min, v_max)
-        if self.sweep_v_start.value() < v_min:
-            self.sweep_v_start.setValue(v_min)
-        if self.sweep_v_end.value() > v_max:
-            self.sweep_v_end.setValue(v_max)
+        # Update sweep voltage sliders
+        self.sweep_v_start_slider.setRange(v_min, v_max)
+        self.sweep_v_end_slider.setRange(v_min, v_max)
+        if self.sweep_v_start_slider.value() < v_min:
+            self.sweep_v_start_slider.setValue(v_min)
+        if self.sweep_v_end_slider.value() > v_max:
+            self.sweep_v_end_slider.setValue(v_max)
 
         # Update PW limits for current voltage
         self._on_voltage_changed_update_pw_limits(self.voltage_slider.value())
@@ -1939,15 +1959,17 @@ class MainWindow(QMainWindow):
             self.pulse_width_slider.setValue(pw_max)
         self.pulse_width_edit.setText(str(self.pulse_width_slider.value()))
 
-        # Update sweep PW spinboxes range (use global min/max across all voltages for this probe)
+        # Update sweep PW sliders range (use global min/max across all voltages for this probe)
         probe = self.probe_tip_box.currentText()
         info = self.PROBE_LIMITS.get(probe, self.PROBE_LIMITS['4mm'])
         global_pw_min = min(row[1] for row in info['table'])
         global_pw_max = max(row[2] for row in info['table'])
-        self.sweep_pw_start.setRange(global_pw_min, global_pw_max)
-        self.sweep_pw_end.setRange(global_pw_min, global_pw_max)
-        if self.sweep_pw_end.value() > global_pw_max:
-            self.sweep_pw_end.setValue(global_pw_max)
+        self.sweep_pw_start_slider.setRange(global_pw_min, global_pw_max)
+        self.sweep_pw_end_slider.setRange(global_pw_min, global_pw_max)
+        if self.sweep_pw_start_slider.value() < global_pw_min:
+            self.sweep_pw_start_slider.setValue(global_pw_min)
+        if self.sweep_pw_end_slider.value() > global_pw_max:
+            self.sweep_pw_end_slider.setValue(global_pw_max)
 
         # Show current limits on label
         self.pw_limits_label.setText(f"PW: {pw_min}–{pw_max} ns @ {voltage}V")
@@ -1996,11 +2018,11 @@ class MainWindow(QMainWindow):
         self.sweep_progress.setValue(0)
 
         config = {
-            'v_start': self.sweep_v_start.value(),
-            'v_end': self.sweep_v_end.value(),
+            'v_start': self.sweep_v_start_slider.value(),
+            'v_end': self.sweep_v_end_slider.value(),
             'v_step': self.sweep_v_step.value(),
-            'pw_start': self.sweep_pw_start.value(),
-            'pw_end': self.sweep_pw_end.value(),
+            'pw_start': self.sweep_pw_start_slider.value(),
+            'pw_end': self.sweep_pw_end_slider.value(),
             'pw_step': self.sweep_pw_step.value(),
             'delay_start': self.sweep_delay_start.value(),
             'delay_end': self.sweep_delay_end.value(),
