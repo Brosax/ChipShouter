@@ -39,5 +39,15 @@ env/
 .DS_Store
 Thumbs.db
 
-# Project specific
+# Runtime data / output
+datas/
+*.csv
 log.txt
+
+# Ruff linter cache
+.ruff_cache/
+
+# AI agent configuration
+.agents/
+.claude/
+skills-lock.json
