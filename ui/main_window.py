@@ -13,11 +13,12 @@ from PySide6.QtWidgets import (
     QDockWidget,
     QFileDialog,
     QMainWindow,
+    QTabWidget,
     QVBoxLayout,
     QWidget,
 )
 from PySide6.QtCore import Qt, QThread, QTimer
-from PySide6.QtGui import QTextCursor
+from PySide6.QtGui import QTextCursor, QResizeEvent
 
 from config import (
     APP_MIN_HEIGHT,
@@ -124,6 +125,7 @@ class MainWindow(QMainWindow):
         layout.addStretch(1)
         self.setCentralWidget(central)
         self.setDockNestingEnabled(False)
+        self.setTabPosition(Qt.RightDockWidgetArea, QTabWidget.North)
 
         # --- Basic Mode (left) ---
         self.basic = BasicPanel()
@@ -168,6 +170,28 @@ class MainWindow(QMainWindow):
         self.dock_terminal.raise_()
         self.splitDockWidget(self.dock_basic, self.dock_log, Qt.Vertical)
         self.dock_log.raise_()
+
+        # Apply initial adaptive proportions after layout is realized.
+        QTimer.singleShot(0, self._apply_adaptive_dock_sizes)
+
+    def _apply_adaptive_dock_sizes(self) -> None:
+        """Resize docks proportionally to current window size."""
+        total_w = max(1, self.width())
+        total_h = max(1, self.height())
+
+        left_w = max(320, int(total_w * 0.40))
+        right_w = max(420, total_w - left_w)
+        self.resizeDocks(
+            [self.dock_basic, self.dock_terminal], [left_w, right_w], Qt.Horizontal
+        )
+
+        log_h = max(180, int(total_h * 0.28))
+        top_h = max(240, total_h - log_h)
+        self.resizeDocks([self.dock_basic, self.dock_log], [top_h, log_h], Qt.Vertical)
+
+    def resizeEvent(self, event: QResizeEvent) -> None:
+        super().resizeEvent(event)
+        self._apply_adaptive_dock_sizes()
 
     # ==================================================================
     # Signal/slot wiring

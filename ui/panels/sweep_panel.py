@@ -4,6 +4,7 @@ and export controls.
 """
 
 from PySide6.QtWidgets import (
+    QAbstractSpinBox,
     QCheckBox,
     QComboBox,
     QGridLayout,
@@ -13,6 +14,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QProgressBar,
     QPushButton,
+    QScrollArea,
     QSlider,
     QSpinBox,
     QTextEdit,
@@ -50,7 +52,15 @@ class SweepPanel(QWidget):
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
-        layout = QVBoxLayout(self)
+        root_layout = QVBoxLayout(self)
+        root_layout.setContentsMargins(0, 0, 0, 0)
+
+        scroll_area = QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+
+        content = QWidget()
+        layout = QVBoxLayout(content)
 
         self._build_info(layout)
         self._build_axis_checkboxes(layout)
@@ -60,6 +70,9 @@ class SweepPanel(QWidget):
         self._build_test_params(layout)
         self._build_controls(layout)
         self._build_results(layout)
+
+        scroll_area.setWidget(content)
+        root_layout.addWidget(scroll_area)
 
     # ------------------------------------------------------------------
     # Sections
@@ -142,6 +155,7 @@ class SweepPanel(QWidget):
         self.sweep_delay_start.setRange(*SWEEP_DELAY_RANGE)
         self.sweep_delay_start.setValue(SWEEP_DELAY_START)
         self.sweep_delay_start.setSuffix(" \u00b5s")
+        self.sweep_delay_start.setButtonSymbols(QAbstractSpinBox.NoButtons)
         g.addWidget(self.sweep_delay_start, 0, 1)
 
         g.addWidget(QLabel("End:"), 0, 2)
@@ -149,6 +163,7 @@ class SweepPanel(QWidget):
         self.sweep_delay_end.setRange(*SWEEP_DELAY_RANGE)
         self.sweep_delay_end.setValue(SWEEP_DELAY_END)
         self.sweep_delay_end.setSuffix(" \u00b5s")
+        self.sweep_delay_end.setButtonSymbols(QAbstractSpinBox.NoButtons)
         g.addWidget(self.sweep_delay_end, 0, 3)
 
         g.addWidget(QLabel("Step:"), 0, 4)
@@ -156,6 +171,7 @@ class SweepPanel(QWidget):
         self.sweep_delay_step.setRange(1, 125)
         self.sweep_delay_step.setValue(SWEEP_DELAY_STEP)
         self.sweep_delay_step.setSuffix(" \u00b5s")
+        self.sweep_delay_step.setButtonSymbols(QAbstractSpinBox.NoButtons)
         g.addWidget(self.sweep_delay_step, 0, 5)
 
         parent.addWidget(self.sd_group)
@@ -168,21 +184,24 @@ class SweepPanel(QWidget):
         self.sweep_pulses = QSpinBox()
         self.sweep_pulses.setRange(1, 1000)
         self.sweep_pulses.setValue(SWEEP_PULSES_PER_POINT)
+        self.sweep_pulses.setButtonSymbols(QAbstractSpinBox.NoButtons)
         g.addWidget(self.sweep_pulses, 0, 1)
 
         g.addWidget(QLabel("Pulse Repeat:"), 0, 2)
         self.sweep_repeat = QSpinBox()
         self.sweep_repeat.setRange(1, 10000)
         self.sweep_repeat.setValue(SWEEP_PULSE_REPEAT)
+        self.sweep_repeat.setButtonSymbols(QAbstractSpinBox.NoButtons)
         g.addWidget(self.sweep_repeat, 0, 3)
 
-        g.addWidget(QLabel("Pulse Interval (s):"), 0, 4)
+        g.addWidget(QLabel("Pulse Interval (ms):"), 0, 4)
         self.sweep_pulse_interval = QSpinBox()
-        self.sweep_pulse_interval.setRange(0, 60)
+        self.sweep_pulse_interval.setRange(0, 60000)
         self.sweep_pulse_interval.setValue(SWEEP_PULSE_INTERVAL)
-        self.sweep_pulse_interval.setSuffix(" s")
+        self.sweep_pulse_interval.setSuffix(" ms")
+        self.sweep_pulse_interval.setButtonSymbols(QAbstractSpinBox.NoButtons)
         self.sweep_pulse_interval.setToolTip(
-            "Delay between each pulse within a test point (seconds)"
+            "Delay between each pulse within a test point (milliseconds)"
         )
         g.addWidget(self.sweep_pulse_interval, 0, 5)
 
@@ -191,6 +210,7 @@ class SweepPanel(QWidget):
         self.sweep_deadtime.setRange(1, 1000)
         self.sweep_deadtime.setValue(SWEEP_DEADTIME)
         self.sweep_deadtime.setSuffix(" ms")
+        self.sweep_deadtime.setButtonSymbols(QAbstractSpinBox.NoButtons)
         g.addWidget(self.sweep_deadtime, 1, 1)
 
         g.addWidget(QLabel("Target Mode:"), 1, 2)

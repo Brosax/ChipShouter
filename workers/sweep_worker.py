@@ -95,7 +95,7 @@ class SweepWorker(QObject):
 
         total = len(voltages) * len(pulse_widths) * len(delays)
         n_pulses = config.get("pulses_per_point", 5)
-        pulse_interval = config.get("pulse_interval", 2)
+        pulse_interval_ms = config.get("pulse_interval", 2000)
         mode = config.get("mode", "1")
 
         self.log_signal.emit(
@@ -193,8 +193,8 @@ class SweepWorker(QObject):
                         if self._stop_requested:
                             break
 
-                        if pulse_idx > 0 and pulse_interval > 0:
-                            time.sleep(pulse_interval)
+                        if pulse_idx > 0 and pulse_interval_ms > 0:
+                            time.sleep(pulse_interval_ms / 1000.0)
 
                         resp = self._target_exchange(ser)
 

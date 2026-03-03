@@ -6,7 +6,8 @@ import serial.tools.list_ports
 from PySide6.QtWidgets import (QApplication, QMainWindow, QPushButton, QVBoxLayout, 
                              QHBoxLayout, QWidget, QSlider, QLabel, QTextEdit, QComboBox,
                              QSpinBox, QGroupBox, QGridLayout, QLineEdit, QCheckBox,
-                             QSplitter, QFrame, QDockWidget, QFileDialog, QProgressBar)
+                             QSplitter, QFrame, QDockWidget, QFileDialog, QProgressBar,
+                             QTabWidget)
 from PySide6.QtCore import QThread, Signal, QObject, Qt, QTimer
 from PySide6.QtGui import QFont, QTextCursor
 from chipshouter import ChipSHOUTER
@@ -894,6 +895,7 @@ class MainWindow(QMainWindow):
         main_layout.setContentsMargins(0, 0, 0, 0)
         main_layout.addStretch(1)
         self.setDockNestingEnabled(False)
+        self.setTabPosition(Qt.RightDockWidgetArea, QTabWidget.North)
 
         # ========== BASIC MODE TAB ==========
         basic_tab = QWidget()
