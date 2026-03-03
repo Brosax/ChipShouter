@@ -1,5 +1,11 @@
 # Change Log
 
+## 2026-02-27
+- Cleaned repository by removing legacy standalone scripts and obsolete files.
+- Removed runtime data artifacts (CSV logs, sweep results), caches, and AI tooling configs from tracking.
+- Updated `.gitignore` to ignore data exports, caches, and tool config files.
+- Added `README.md` with project overview, architecture, setup, and hardware notes.
+
 ## 2026-02-13
 - Removed Expert Mode from `shouter_gui.py`:
   - Removed Expert Mode tab, code editor, and execution log UI.

@@ -98,6 +98,7 @@ SWEEP_PULSES_PER_POINT = 5
 SWEEP_PULSE_REPEAT = 1
 SWEEP_PULSE_INTERVAL = 2  # seconds between pulses within a point
 SWEEP_DEADTIME = 10
+SWEEP_EXPECTED_CT = ""
 
 # ---------------------------------------------------------------------------
 # KW45 target protocol marker

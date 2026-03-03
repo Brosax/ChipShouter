@@ -79,7 +79,7 @@ def export_sweep_results_to_csv(results: list[dict], file_path: str) -> None:
                 "normal",
                 "total",
                 "glitch_rate",
-                "baseline_ct",
+                "glitch_cts",
                 "last_ct",
             ]
         )
@@ -95,7 +95,7 @@ def export_sweep_results_to_csv(results: list[dict], file_path: str) -> None:
                     r["normal"],
                     r["total"],
                     r["rate"],
-                    r.get("baseline_ct", ""),
+                    r.get("glitch_cts", ""),
                     r.get("last_ct", ""),
                 ]
             )

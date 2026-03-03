@@ -36,6 +36,7 @@ from config import (
     SWEEP_PULSE_INTERVAL,
     SWEEP_PULSE_REPEAT,
     SWEEP_PULSES_PER_POINT,
+    SWEEP_EXPECTED_CT,
     SWEEP_V_END,
     SWEEP_V_START,
     SWEEP_V_STEP,
@@ -198,6 +199,13 @@ class SweepPanel(QWidget):
         self.sweep_mode_box.setCurrentText("1")
         g.addWidget(self.sweep_mode_box, 1, 3)
 
+        g.addWidget(QLabel("Expected CT:"), 1, 4)
+        self.sweep_expected_ct = QLineEdit(SWEEP_EXPECTED_CT)
+        self.sweep_expected_ct.setPlaceholderText(
+            "Leave blank to auto-lock first valid CT"
+        )
+        g.addWidget(self.sweep_expected_ct, 1, 5)
+
         parent.addWidget(group)
 
     def _build_controls(self, parent: QVBoxLayout) -> None:
@@ -301,6 +309,7 @@ class SweepPanel(QWidget):
             "deadtime": self.sweep_deadtime.value(),
             "pulse_interval": self.sweep_pulse_interval.value(),
             "mode": self.sweep_mode_box.currentText(),
+            "expected_ct": self.sweep_expected_ct.text().strip(),
             "sweep_axes": self.get_sweep_axes(),
         }
 

@@ -119,12 +119,23 @@ class SweepWorker(QObject):
         except Exception:
             pass
 
-        # ---- Set KW45 mode & get baseline CT ----
-        baseline_ct = self._setup_target_mode(ser, mode)
-        if baseline_ct is None and not self._stop_requested:
-            self.log_signal.emit(
-                "WARNING: Could not obtain baseline CT. Glitch detection may be inaccurate."
-            )
+        configured_expected_ct = str(config.get("expected_ct", "")).strip()
+        manual_expected = bool(configured_expected_ct)
+
+        # ---- Set KW45 mode and establish expected CT ----
+        if manual_expected:
+            expected_ct = configured_expected_ct
+            expected_ct_cmp = self._normalize_ct(expected_ct)
+            self._setup_target_mode(ser, mode)
+            self.log_signal.emit(f"Using configured expected CT: {expected_ct}")
+        else:
+            expected_ct = self._setup_target_mode(ser, mode)
+            expected_ct_cmp = self._normalize_ct(expected_ct)
+            if not expected_ct_cmp:
+                self.log_signal.emit(
+                    "WARNING: Could not establish expected CT from target. "
+                    "Will lock on first valid CT during sweep."
+                )
 
         step = 0
         for v in voltages:
@@ -176,6 +187,7 @@ class SweepWorker(QObject):
                     # 4) Pulse loop
                     glitch, error, normal, reset = 0, 0, 0, 0
                     last_ct = ""
+                    glitch_cts: list[str] = []
 
                     for pulse_idx in range(n_pulses):
                         if self._stop_requested:
@@ -197,20 +209,33 @@ class SweepWorker(QObject):
                                 f"KW45 RESET #{self.reset_count} at V={v} PW={pw} "
                                 f"D={delay_us}us pulse#{pulse_idx + 1}"
                             )
-                            new_bl = self._setup_target_mode(ser, mode)
-                            if new_bl:
-                                baseline_ct = new_bl
+                            new_expected = self._setup_target_mode(ser, mode)
+                            if new_expected and not manual_expected:
+                                expected_ct = new_expected
+                                expected_ct_cmp = self._normalize_ct(expected_ct)
                                 self.log_signal.emit(
-                                    f"New baseline CT after reset: {baseline_ct}"
+                                    f"Expected CT refreshed after reset: {expected_ct}"
                                 )
                             if not self._try_clear_and_arm():
                                 break
                             continue
 
                         ct = resp.get("CT", "")
+                        ct_cmp = self._normalize_ct(ct)
+                        if not ct_cmp:
+                            error += 1
+                            continue
+
+                        # If expected CT is not known yet, lock on the first valid CT.
+                        if not expected_ct_cmp:
+                            expected_ct = ct
+                            expected_ct_cmp = ct_cmp
+                            self.log_signal.emit(f"Expected CT locked: {expected_ct}")
+
                         last_ct = ct
-                        if baseline_ct and ct and ct != baseline_ct:
+                        if ct_cmp != expected_ct_cmp:
                             glitch += 1
+                            glitch_cts.append(ct)
                         else:
                             normal += 1
 
@@ -224,7 +249,8 @@ class SweepWorker(QObject):
                         "normal": normal,
                         "resets": reset,
                         "total": n_total,
-                        "baseline_ct": baseline_ct or "",
+                        "baseline_ct": "",
+                        "glitch_cts": ";".join(glitch_cts),
                         "last_ct": last_ct,
                         "rate": f"{glitch / n_total * 100:.1f}%"
                         if n_total > 0
@@ -270,7 +296,7 @@ class SweepWorker(QObject):
     # Internal helpers
     # ------------------------------------------------------------------
     def _setup_target_mode(self, ser, mode: str):
-        """Send MODE:<n>, do one clean START exchange, return baseline CT or None."""
+        """Send MODE:<n>, synchronize state, and return expected CT if available."""
         try:
             ser.reset_input_buffer()
             ser.write(f"MODE:{mode}\r\n".encode())
@@ -279,9 +305,10 @@ class SweepWorker(QObject):
             self.log_signal.emit(f"Target MODE:{mode} set")
 
             resp = self._target_exchange(ser)
-            if resp and "CT" in resp and not resp.get("_reset"):
-                self.log_signal.emit(f"Baseline CT: {resp['CT']}")
-                return resp["CT"]
+            if resp and not resp.get("_reset") and resp.get("CT"):
+                expected_ct = resp.get("CT", "")
+                self.log_signal.emit(f"Expected CT: {expected_ct}")
+                return expected_ct
             return None
         except Exception as e:
             self.log_signal.emit(f"Target mode setup error: {e}")
@@ -325,6 +352,13 @@ class SweepWorker(QObject):
             return data if data else None
         except Exception:
             return None
+
+    @staticmethod
+    def _normalize_ct(value) -> str:
+        """Normalize CT string for robust comparisons."""
+        if value is None:
+            return ""
+        return str(value).strip().replace(" ", "").lower()
 
     def _safe_disarm(self) -> None:
         """Disarm ChipSHOUTER with retry."""
